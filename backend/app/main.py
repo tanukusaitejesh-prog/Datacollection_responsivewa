@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import contextlib
 from .supabase_db import push_metadata_to_supabase, upload_file_to_supabase
+from .mongo_db import push_metadata_to_mongo
 
 from .landmarks25 import (
     CUSTOM_25_CSV_COLUMNS,
@@ -220,6 +221,18 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
         print(f"Capture {capture_id} data pushed to Supabase.")
     except Exception as exc:
         print(f"Failed to push to Supabase: {exc}")
+
+    # MongoDB Integration (Local)
+    try:
+        mongo_payload = {
+            "capture_id": capture_id,
+            "meta": conversion_meta,
+            "storage_paths": storage_paths if 'storage_paths' in dir() else {},
+        }
+        await push_metadata_to_mongo(mongo_payload)
+        print(f"Capture {capture_id} data pushed to local MongoDB.")
+    except Exception as exc:
+        print(f"Failed to push to MongoDB: {exc}")
 
     return {
         "status": "ok",

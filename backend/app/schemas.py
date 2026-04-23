@@ -9,6 +9,9 @@ class CaptureMeta(BaseModel):
     device: str = Field(min_length=1)
     camera_facing: Literal["front", "back"]
     session_id: str | None = None
+    subject_name: str | None = None
+    subject_id: str | None = None
+    action_type: str | None = None
     age: int | None = Field(default=None, ge=1, le=120)
     gender: Literal["male", "female", "other", "prefer_not_to_say"] | None = None
 

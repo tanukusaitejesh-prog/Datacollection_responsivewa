@@ -20,14 +20,12 @@ function zToColor(z: number): string {
 
 export class PoseEngine {
   private landmarker: PoseLandmarker | null = null;
-  private videoElement: HTMLVideoElement;
   private canvasElement: HTMLCanvasElement;
   private canvasCtx: CanvasRenderingContext2D;
   private onResultsCallbacks: PoseCallback[] = [];
   private isLoaded = false;
 
-  constructor(video: HTMLVideoElement, canvas: HTMLCanvasElement) {
-    this.videoElement = video;
+  constructor(_video: HTMLVideoElement, canvas: HTMLCanvasElement) {
     this.canvasElement = canvas;
     this.canvasCtx = canvas.getContext('2d')!;
     this.init();

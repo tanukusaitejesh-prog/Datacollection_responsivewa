@@ -64,15 +64,17 @@ body {
   width: 100%;
   border: 1px solid #BFD0DE;
   border-radius: 10px;
-  padding: 12px;
+  padding: 10px;
   font-size: 14px;
-  margin-top: 8px;
+  margin-top: 4px;
   outline: none;
   transition: border-color 0.2s;
+  background: #fdfdfe;
 }
 
 .input-field:focus {
   border-color: var(--accent);
+  background: white;
 }
 
 /* CHIPS */
@@ -164,7 +166,12 @@ body {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  transform: scaleX(-1); /* Mirror by default for front-facing feel */
+  transform: scaleX(-1); /* Mirror by default */
+}
+
+/* Disable mirror for back camera */
+.camera-stream.back {
+  transform: none;
 }
 
 .landmark-canvas {
@@ -175,6 +182,28 @@ body {
   height: 100%;
   pointer-events: none;
   transform: scaleX(-1); /* Mirror to match camera-stream */
+}
+
+.landmark-canvas.back {
+  transform: none;
+}
+
+.flip-btn {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  background: rgba(255,255,255,0.2);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255,255,255,0.3);
+  color: white;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 20;
 }
 
 /* RECORDING INDICATORS */
@@ -197,9 +226,10 @@ body {
 
 .stop-btn-overlay {
   position: absolute;
-  bottom: 24px;
+  bottom: 40px;
   left: 20px;
   right: 20px;
+  z-index: 100;
 }
 
 /* STEPS */
@@ -237,3 +267,38 @@ body {
 
 .check-ok { color: var(--success); }
 .check-fail { color: var(--error); }
+
+/* MODALS */
+.modal-overlay {
+  position: fixed;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(5, 27, 44, 0.95);
+  z-index: 1000;
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  text-align: center;
+}
+
+.modal-code {
+  background: rgba(255,255,255,0.1);
+  padding: 16px;
+  border-radius: 12px;
+  text-align: left;
+  font-size: 13px;
+  margin: 20px 0;
+  width: 100%;
+  max-width: 400px;
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
