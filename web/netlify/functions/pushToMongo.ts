@@ -19,7 +19,30 @@ async function connectToDatabase() {
 }
 
 export const handler: Handler = async (event) => {
-  // Only allow POST requests
+  // GET request acts as a connection test
+  if (event.httpMethod === 'GET') {
+    try {
+      const client = await connectToDatabase();
+      await client.db(DB_NAME).command({ ping: 1 });
+      return {
+        statusCode: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ success: true, message: 'MongoDB connection successful!' }),
+      };
+    } catch (error) {
+      console.error('MongoDB test error:', error);
+      return {
+        statusCode: 500,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          success: false, 
+          error: error instanceof Error ? error.message : 'Unknown connection error' 
+        }),
+      };
+    }
+  }
+
+  // Only allow POST and GET
   if (event.httpMethod !== 'POST') {
     return {
       statusCode: 405,

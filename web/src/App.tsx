@@ -7,11 +7,16 @@ import {
   ArrowLeft,
   ChevronRight,
   UploadCloud,
-  FlipHorizontal
+  FlipHorizontal,
+  FileCheck,
+  CheckCircle2,
+  XCircle
 } from 'lucide-react';
 import { PoseLandmarkerResult } from '@mediapipe/tasks-vision';
 import { supabase } from './lib/supabase';
 import { evaluateCaptureReadiness } from './lib/quality';
+import { validatePoseData, ValidationResult, createNpyBuffer } from './lib/validator-utils';
+import { Validator } from './Validator';
 
 const GENDER_OPTIONS = [
   { value: 'male', label: 'Male' },
@@ -21,27 +26,40 @@ const GENDER_OPTIONS = [
 ] as const;
 
 type Gender = (typeof GENDER_OPTIONS)[number]['value'];
-type Step = 'home' | 'testing' | 'recording' | 'confirm';
+type Step = 'home' | 'testing' | 'recording' | 'confirm' | 'validator';
 type CameraFacing = 'user' | 'environment';
+type CaptureMode = 'pose_only' | 'holistic';
 
 async function uploadToSupabaseDirect(payload: any, captureId: string) {
   try {
-    const fileName = `${captureId}/raw_capture.json`;
-    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    const jsonFileName = `${captureId}/raw_capture.json`;
+    const npyFileName = `${captureId}/keypoints.npy`;
+    
+    const jsonBlob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    const npyBuffer = createNpyBuffer(payload.keypoints);
+    const npyBlob = new Blob([npyBuffer], { type: 'application/octet-stream' });
 
-    const { error: storageError } = await supabase.storage
+    // 1. Upload JSON
+    const { error: jsonError } = await supabase.storage
       .from('pose-captures')
-      .upload(fileName, blob, {
-        upsert: true
-      });
+      .upload(jsonFileName, jsonBlob, { upsert: true });
 
-    if (storageError) throw storageError;
+    if (jsonError) throw jsonError;
 
+    // 2. Upload NPY
+    const { error: npyError } = await supabase.storage
+      .from('pose-captures')
+      .upload(npyFileName, npyBlob, { upsert: true });
+
+    if (npyError) throw npyError;
+
+    // 3. Insert DB record
     const { error: dbError } = await supabase.from('captures').insert({
       capture_id: captureId,
       meta: payload.meta,
       storage_paths: {
-        raw_json: fileName
+        raw_json: jsonFileName,
+        keypoints_npy: npyFileName
       }
     });
 
@@ -68,13 +86,13 @@ async function pushToMongoDirect(payload: any, captureId: string) {
 
     if (!response.ok) {
       const errorData = await response.json();
-      throw new Error(errorData.message || 'Failed to push to MongoDB');
+      throw new Error(errorData.error || errorData.message || 'Failed to push to MongoDB');
     }
 
     return true;
-  } catch (err) {
+  } catch (err: any) {
     console.error('Web MongoDB direct push failed:', err);
-    return false;
+    return { success: false, error: err.message };
   }
 }
 
@@ -86,6 +104,9 @@ export default function App() {
   
   // Recording Data
   const framesRef = useRef<number[][][]>([]);
+  const faceFramesRef = useRef<number[][][]>([]);
+  const handFramesRef = useRef<number[][][]>([]);
+  const faceBlendshapesRef = useRef<any[]>([]);
   const timestampsRef = useRef<number[]>([]);
   const startTimeRef = useRef<number>(0);
 
@@ -97,6 +118,7 @@ export default function App() {
   const [frameCount, setFrameCount] = useState(0);
   const [duration, setDuration] = useState(0);
   const [latestResults, setLatestResults] = useState<PoseLandmarkerResult | null>(null);
+  const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
 
   // Metadata State
   const [sessionId, setSessionId] = useState('');
@@ -106,6 +128,7 @@ export default function App() {
   const [age, setAge] = useState<string>('');
   const [gender, setGender] = useState<Gender>('prefer_not_to_say');
   const [cameraFacing, setCameraFacing] = useState<CameraFacing>('user');
+  const [captureMode, setCaptureMode] = useState<CaptureMode>('holistic');
   const [showPermissionGuide, setShowPermissionGuide] = useState(false);
 
   useEffect(() => {
@@ -165,23 +188,47 @@ export default function App() {
   const startEngineLoop = async () => {
     const loop = async () => {
       if (videoRef.current && engineRef.current) {
-        await engineRef.current.send(videoRef.current);
+        await engineRef.current.send(videoRef.current, {
+          face: captureMode === 'holistic',
+          hands: captureMode === 'holistic'
+        });
         requestAnimationFrame(loop);
       }
     };
     loop();
   };
 
-  const handlePoseResults = (results: PoseLandmarkerResult) => {
-    setLatestResults(results);
+  const handlePoseResults = (results: any) => {
+    setLatestResults(results.pose);
     
-    if (isRecording && results.landmarks && results.landmarks.length > 0) {
-      const poseLandmarks = results.landmarks[0];
-      const frame = poseLandmarks.map(lm => [
-        lm.x, lm.y, lm.z, lm.visibility ?? 0
+    if (isRecording && results.pose && results.pose.landmarks && results.pose.landmarks.length > 0) {
+      const poseLandmarks = results.pose.landmarks[0];
+      const frame = poseLandmarks.map((lm: any) => [
+        lm.x, lm.y, lm.z
       ]);
       
       framesRef.current.push(frame);
+
+      if (results.face && results.face.faceLandmarks && results.face.faceLandmarks.length > 0) {
+        faceFramesRef.current.push(results.face.faceLandmarks[0].map((lm: any) => [lm.x, lm.y, lm.z]));
+        faceBlendshapesRef.current.push(results.face.faceBlendshapes?.[0] || []);
+      } else {
+        // Pad with 478 zeros for consistency
+        faceFramesRef.current.push(Array(478).fill([0, 0, 0]));
+        faceBlendshapesRef.current.push([]);
+      }
+
+      if (results.hands && results.hands.landmarks && results.hands.landmarks.length > 0) {
+        // We want a fixed 42 points (21 per hand). 
+        // If only 1 hand, we pad the rest.
+        const landmarks = results.hands.landmarks.flat().map((lm: any) => [lm.x, lm.y, lm.z]);
+        while (landmarks.length < 42) landmarks.push([0, 0, 0]);
+        handFramesRef.current.push(landmarks.slice(0, 42));
+      } else {
+        // Pad with 42 zeros
+        handFramesRef.current.push(Array(42).fill([0, 0, 0]));
+      }
+
       const elapsed = Date.now() - startTimeRef.current;
       timestampsRef.current.push(elapsed);
       setFrameCount(framesRef.current.length);
@@ -191,6 +238,9 @@ export default function App() {
 
   const startRecording = () => {
     framesRef.current = [];
+    faceFramesRef.current = [];
+    handFramesRef.current = [];
+    faceBlendshapesRef.current = [];
     timestampsRef.current = [];
     startTimeRef.current = Date.now();
     setFrameCount(0);
@@ -201,10 +251,12 @@ export default function App() {
 
   const stopRecording = () => {
     setIsRecording(false);
+    const result = validatePoseData(framesRef.current);
+    setValidationResult(result);
     setStep('confirm');
   };
 
-  const handleFinalize = async (destination: 'supabase' | 'mongo') => {
+  const handleFinalize = async (destination: 'supabase' | 'mongo' | 'both') => {
     setIsUploading(true);
     
     const captureId = `web_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
@@ -215,7 +267,11 @@ export default function App() {
     const payload = {
       keypoints: framesRef.current,
       timestamps: timestampsRef.current,
+      face_keypoints: captureMode === 'holistic' ? faceFramesRef.current : [],
+      face_blendshapes: captureMode === 'holistic' ? faceBlendshapesRef.current : [],
+      hand_keypoints: captureMode === 'holistic' ? handFramesRef.current : [],
       meta: {
+        capture_mode: captureMode,
         fps_nominal: isFinite(actualFps) ? actualFps : 30,
         resolution: [1280, 720],
         device: 'Web Chrome',
@@ -230,20 +286,71 @@ export default function App() {
     };
 
     let success = false;
+    let errorMessage = '';
+
     if (destination === 'supabase') {
       success = await uploadToSupabaseDirect(payload, captureId);
+      if (!success) errorMessage = 'Unknown Supabase error';
     } else if (destination === 'mongo') {
-      success = await pushToMongoDirect(payload, captureId);
+      const result = await pushToMongoDirect(payload, captureId);
+      if (result === true) {
+        success = true;
+      } else {
+        success = false;
+        errorMessage = (result as any).error || 'Unknown MongoDB error';
+      }
+    } else if (destination === 'both') {
+      const [sRes, mRes] = await Promise.all([
+        uploadToSupabaseDirect(payload, captureId),
+        pushToMongoDirect(payload, captureId)
+      ]);
+      
+      const sSuccess = sRes === true;
+      const mSuccess = mRes === true;
+      
+      if (sSuccess && mSuccess) {
+        success = true;
+      } else {
+        success = false;
+        if (!sSuccess) errorMessage += 'Supabase failed. ';
+        if (!mSuccess) errorMessage += `MongoDB failed: ${(mRes as any)?.error || 'Unknown'}`;
+      }
     }
     
     setIsUploading(false);
 
     if (success) {
-      alert(`Upload to ${destination === 'supabase' ? 'Cloud' : 'MongoDB'} Successful!`);
+      let destName = '';
+      if (destination === 'supabase') destName = 'Cloud';
+      else if (destination === 'mongo') destName = 'MongoDB';
+      else destName = 'Both Platforms';
+      
+      alert(`Upload to ${destName} Successful!`);
       setStep('home');
     } else {
-      alert(`Upload to ${destination === 'supabase' ? 'Cloud' : 'MongoDB'} Failed. Check your connection.`);
+      let destName = '';
+      if (destination === 'supabase') destName = 'Cloud';
+      else if (destination === 'mongo') destName = 'MongoDB';
+      else destName = 'Both Platforms';
+
+      alert(`Upload to ${destName} Failed.\nError: ${errorMessage}`);
     }
+  };
+
+  const testMongoConnection = async () => {
+    setIsUploading(true);
+    try {
+      const res = await fetch('/.netlify/functions/pushToMongo');
+      const data = await res.json();
+      if (res.ok) {
+        alert('MongoDB Connection Successful! ??');
+      } else {
+        alert(`MongoDB Connection Failed!\nReason: ${data.error || data.message}`);
+      }
+    } catch (err: any) {
+      alert(`Network Error: ${err.message}`);
+    }
+    setIsUploading(false);
   };
 
   const toggleCamera = () => {
@@ -304,6 +411,36 @@ export default function App() {
               <div className="card-title">Session Settings</div>
               <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Custom Session ID (Optional)</label>
               <input className="input-field" value={sessionId} onChange={e => setSessionId(e.target.value)} placeholder="Auto-generated if empty" />
+              
+              <div style={{marginTop: 12}}>
+                <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Capture Mode</label>
+                <div style={{display: 'flex', gap: 8, marginTop: 4}}>
+                  <button 
+                    className={`chip ${captureMode === 'pose_only' ? 'active' : ''}`}
+                    style={{flex: 1, textAlign: 'center'}}
+                    onClick={() => setCaptureMode('pose_only')}
+                  >
+                    Pose Only
+                  </button>
+                  <button 
+                    className={`chip ${captureMode === 'holistic' ? 'active' : ''}`}
+                    style={{flex: 1, textAlign: 'center'}}
+                    onClick={() => setCaptureMode('holistic')}
+                  >
+                    Holistic
+                  </button>
+                </div>
+              </div>
+
+              <button 
+                className="btn btn-secondary" 
+                style={{marginTop: 15, width: '100%', fontSize: 12, padding: '8px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 6}}
+                onClick={testMongoConnection}
+                disabled={isUploading}
+              >
+                {isUploading ? <RefreshCw size={14} className="animate-spin" /> : <AlertCircle size={14} />}
+                Test MongoDB Connection
+              </button>
             </div>
 
             <button 
@@ -313,8 +450,20 @@ export default function App() {
             >
               Next: Camera Check <ChevronRight size={18} />
             </button>
+
+            <button 
+              className="btn btn-secondary" 
+              style={{ marginTop: 10 }}
+              onClick={() => setStep('validator')}
+            >
+              <FileCheck size={18} /> Open Data Validator
+            </button>
           </div>
         </div>
+      )}
+
+      {step === 'validator' && (
+        <Validator onBack={() => setStep('home')} />
       )}
 
       {step === 'testing' && (
@@ -399,6 +548,29 @@ export default function App() {
               <div className="card-title">Captured Data</div>
               <p className="check-item">Frames: {frameCount} ({ (frameCount/(duration/1000 || 1)).toFixed(1) } FPS)</p>
               <p className="check-item">Duration: {(duration/1000).toFixed(1)}s</p>
+              
+              {validationResult && (
+                <div style={{ 
+                  marginTop: 12, 
+                  padding: '10px 12px', 
+                  borderRadius: 10, 
+                  display: 'flex', 
+                  alignItems: 'center', 
+                  gap: 10,
+                  backgroundColor: validationResult.overall === 'pass' ? 'rgba(31, 138, 109, 0.1)' : validationResult.overall === 'warn' ? 'rgba(217, 119, 6, 0.1)' : 'rgba(183, 78, 99, 0.1)',
+                  border: `1px solid ${validationResult.overall === 'pass' ? 'var(--success)' : validationResult.overall === 'warn' ? '#d97706' : 'var(--error)'}`
+                }}>
+                  {validationResult.overall === 'pass' ? <CheckCircle2 size={18} color="var(--success)" /> : validationResult.overall === 'warn' ? <AlertCircle size={18} color="#d97706" /> : <XCircle size={18} color="var(--error)" />}
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700, color: validationResult.overall === 'pass' ? 'var(--success)' : validationResult.overall === 'warn' ? '#d97706' : 'var(--error)' }}>
+                      {validationResult.overall === 'pass' ? 'Training Ready' : validationResult.overall === 'warn' ? 'Usable (Warnings)' : 'Quality Issue'}
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                      {validationResult.overall === 'pass' ? 'Meets all ASD-MTD requirements.' : validationResult.overall === 'warn' ? `${validationResult.warns} warnings detected.` : `${validationResult.fails} critical errors.`}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="card">
@@ -445,6 +617,18 @@ export default function App() {
                 >
                   {isUploading ? <RefreshCw className="animate-spin" /> : <UploadCloud />}
                   {isUploading ? 'Finalizing...' : 'Finalize & Send to MongoDB'}
+                </button>
+                <button 
+                  className="btn btn-primary" 
+                  style={{ 
+                    background: 'linear-gradient(135deg, var(--accent) 0%, #47A248 100%)',
+                    boxShadow: '0 4px 15px rgba(14, 106, 168, 0.2)'
+                  }}
+                  disabled={isUploading}
+                  onClick={() => handleFinalize('both')}
+                >
+                  {isUploading ? <RefreshCw className="animate-spin" /> : <RefreshCw />}
+                  {isUploading ? 'Syncing Both...' : 'Finalize & Sync to Both'}
                 </button>
               </div>
               <button 

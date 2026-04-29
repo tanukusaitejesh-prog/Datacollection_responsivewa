@@ -1,10 +1,28 @@
-import { PoseLandmarker, FilesetResolver, PoseLandmarkerResult } from '@mediapipe/tasks-vision';
+import { 
+  PoseLandmarker, FaceLandmarker, HandLandmarker, 
+  FilesetResolver, 
+  PoseLandmarkerResult, FaceLandmarkerResult, HandLandmarkerResult 
+} from '@mediapipe/tasks-vision';
 
-export type PoseCallback = (results: PoseLandmarkerResult) => void;
+export type HolisticCallback = (results: {
+  pose: PoseLandmarkerResult | null;
+  face: FaceLandmarkerResult | null;
+  hands: HandLandmarkerResult | null;
+}) => void;
 
 const SKELETON_EDGES: Array<[number, number]> = [
-  [11, 13], [13, 15], [12, 14], [14, 16], [11, 12], [23, 24],
-  [11, 23], [12, 24], [23, 25], [25, 27], [24, 26], [26, 28]
+  // Face
+  [0, 1], [1, 2], [2, 3], [3, 7], [0, 4], [4, 5], [5, 6], [6, 8], [9, 10],
+  // Torso
+  [11, 12], [11, 23], [12, 24], [23, 24],
+  // Arms
+  [11, 13], [13, 15], [12, 14], [14, 16],
+  // Hands
+  [15, 17], [15, 19], [15, 21], [17, 19], 
+  [16, 18], [16, 20], [16, 22], [18, 20],
+  // Legs & Feet
+  [23, 25], [25, 27], [27, 29], [29, 31], [31, 27],
+  [24, 26], [26, 28], [28, 30], [30, 32], [32, 28]
 ];
 
 function clamp(value: number, minValue: number, maxValue: number): number {
@@ -19,10 +37,13 @@ function zToColor(z: number): string {
 }
 
 export class PoseEngine {
-  private landmarker: PoseLandmarker | null = null;
+  private poseLandmarker: PoseLandmarker | null = null;
+  private faceLandmarker: FaceLandmarker | null = null;
+  private handLandmarker: HandLandmarker | null = null;
+  
   private canvasElement: HTMLCanvasElement;
   private canvasCtx: CanvasRenderingContext2D;
-  private onResultsCallbacks: PoseCallback[] = [];
+  private onResultsCallbacks: HolisticCallback[] = [];
   private isLoaded = false;
 
   constructor(_video: HTMLVideoElement, canvas: HTMLCanvasElement) {
@@ -37,13 +58,41 @@ export class PoseEngine {
         "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
       );
       
-      this.landmarker = await PoseLandmarker.createFromOptions(vision, {
+      this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
         baseOptions: {
-          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task`,
+          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task`,
           delegate: "GPU"
         },
         runningMode: "VIDEO",
-        numPoses: 1
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.5,
+        minPosePresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+
+      this.faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numFaces: 1,
+        minFaceDetectionConfidence: 0.4,
+        minFacePresenceConfidence: 0.4,
+        minTrackingConfidence: 0.4,
+        outputFaceBlendshapes: true
+      });
+
+      this.handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 2,
+        minHandDetectionConfidence: 0.4,
+        minHandPresenceConfidence: 0.4,
+        minTrackingConfidence: 0.4
       });
 
       this.isLoaded = true;
@@ -53,25 +102,43 @@ export class PoseEngine {
     }
   }
 
-  public onResults(cb: PoseCallback) {
+  public onResults(cb: HolisticCallback) {
     this.onResultsCallbacks.push(cb);
   }
 
-  public async send(video: HTMLVideoElement) {
-    if (!this.landmarker || !this.isLoaded) return;
+  public async send(video: HTMLVideoElement, options: { face: boolean; hands: boolean } = { face: true, hands: true }) {
+    if (!this.poseLandmarker || !this.isLoaded) return;
     const startTimeMs = performance.now();
-    const result = this.landmarker.detectForVideo(video, startTimeMs);
-    this.handleResults(result);
+    
+    // MediaPipe detectForVideo is synchronous, so we don't need Promise.all
+    // but we can still run them conditionally
+    const poseResult = this.poseLandmarker.detectForVideo(video, startTimeMs);
+    
+    let faceResult: FaceLandmarkerResult | null = null;
+    if (options.face && this.faceLandmarker) {
+      faceResult = this.faceLandmarker.detectForVideo(video, startTimeMs);
+    }
+
+    let handResult: HandLandmarkerResult | null = null;
+    if (options.hands && this.handLandmarker) {
+      handResult = this.handLandmarker.detectForVideo(video, startTimeMs);
+    }
+    
+    this.handleResults({ pose: poseResult, face: faceResult, hands: handResult });
   }
 
-  private handleResults(results: PoseLandmarkerResult) {
+  private handleResults(results: {
+    pose: PoseLandmarkerResult | null;
+    face: FaceLandmarkerResult | null;
+    hands: HandLandmarkerResult | null;
+  }) {
     const ctx = this.canvasCtx;
     const { width, height } = this.canvasElement;
 
     ctx.clearRect(0, 0, width, height);
 
-    if (results.landmarks && results.landmarks.length > 0) {
-      const landmarks = results.landmarks[0];
+    if (results.pose && results.pose.landmarks && results.pose.landmarks.length > 0) {
+      const landmarks = results.pose.landmarks[0];
 
       // Draw Edges
       SKELETON_EDGES.forEach(([from, to]) => {
@@ -88,11 +155,8 @@ export class PoseEngine {
         }
       });
 
-      // Draw Joints
-      landmarks.forEach((lm, idx) => {
-        // Only draw major joints to keep it clean (same indices as edges + hips)
-        const majorIndices = [11, 12, 13, 14, 15, 16, 23, 24, 25, 26, 27, 28];
-        if (!majorIndices.includes(idx)) return;
+      // Draw All Joints
+      landmarks.forEach((lm) => {
 
         const x = lm.x * width;
         const y = lm.y * height;
@@ -108,10 +172,35 @@ export class PoseEngine {
       });
     }
 
+    // Quick draw face points (small dots)
+    if (results.face && results.face.faceLandmarks && results.face.faceLandmarks.length > 0) {
+      const faceLms = results.face.faceLandmarks[0];
+      ctx.fillStyle = 'rgba(0, 255, 0, 0.6)';
+      faceLms.forEach(lm => {
+        ctx.beginPath();
+        ctx.arc(lm.x * width, lm.y * height, 1, 0, 2 * Math.PI);
+        ctx.fill();
+      });
+    }
+
+    // Quick draw hand points
+    if (results.hands && results.hands.landmarks && results.hands.landmarks.length > 0) {
+      ctx.fillStyle = 'rgba(255, 100, 0, 0.8)';
+      results.hands.landmarks.forEach(handLms => {
+        handLms.forEach(lm => {
+          ctx.beginPath();
+          ctx.arc(lm.x * width, lm.y * height, 2, 0, 2 * Math.PI);
+          ctx.fill();
+        });
+      });
+    }
+
     this.onResultsCallbacks.forEach(cb => cb(results));
   }
 
   public close() {
-    this.landmarker?.close();
+    this.poseLandmarker?.close();
+    this.faceLandmarker?.close();
+    this.handLandmarker?.close();
   }
 }

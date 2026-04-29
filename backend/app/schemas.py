@@ -20,6 +20,8 @@ class UploadPayload(BaseModel):
     keypoints: list[list[list[float]]]
     timestamps: list[float]
     meta: CaptureMeta
+    face_keypoints: list[list[list[float]]] | None = None
+    hand_keypoints: list[list[list[float]]] | None = None
 
     @model_validator(mode="after")
     def validate_shapes(self) -> "UploadPayload":

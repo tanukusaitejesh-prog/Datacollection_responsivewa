@@ -52,3 +52,6 @@ mobile/android/.cxx/
 mobile/android/build/
 mobile/android/app/build/
 mobile/android/captures/
+
+# Local Netlify folder
+.netlify
