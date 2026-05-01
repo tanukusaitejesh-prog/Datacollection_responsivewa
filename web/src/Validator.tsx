@@ -104,6 +104,10 @@ export const Validator: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     const obj = JSON.parse(text);
     let frames: number[][] = [];
     let arr = Array.isArray(obj) ? obj : null;
+    const toCoord = (value: any) => {
+      if (value === 'NaN') return Number.NaN;
+      return typeof value === 'number' && Number.isFinite(value) ? value : Number.NaN;
+    };
     if (!arr && typeof obj === 'object') {
       if (Array.isArray(obj.data)) arr = obj.data;
       else if (Array.isArray(obj.frames)) arr = obj.frames;
@@ -128,9 +132,9 @@ export const Validator: React.FC<{ onBack: () => void }> = ({ onBack }) => {
         let flat = [];
         for (let i = 0; i < 33; i++) {
           let lm = landmarks[i];
-          if (Array.isArray(lm)) { flat.push(lm[0] || 0, lm[1] || 0, lm[2] || 0); }
-          else if (typeof lm === 'object') { flat.push(lm.x || 0, lm.y || 0, lm.z || 0); }
-          else { flat.push(0,0,0); }
+          if (Array.isArray(lm)) { flat.push(toCoord(lm[0]), toCoord(lm[1]), toCoord(lm[2])); }
+          else if (typeof lm === 'object') { flat.push(toCoord(lm.x), toCoord(lm.y), toCoord(lm.z)); }
+          else { flat.push(Number.NaN, Number.NaN, Number.NaN); }
         }
         frames.push(flat);
       }
@@ -195,7 +199,11 @@ export const Validator: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     }
 
     let mnx=Infinity, mxx=-Infinity, mny=Infinity, mxy=-Infinity;
-    pts.forEach(p=>{ if(p.x<mnx) mnx=p.x; if(p.x>mxx) mxx=p.x; if(p.y<mny) mny=p.y; if(p.y>mxy) mxy=p.y; });
+    pts.forEach(p=>{
+      if(!Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
+      if(p.x<mnx) mnx=p.x; if(p.x>mxx) mxx=p.x; if(p.y<mny) mny=p.y; if(p.y>mxy) mxy=p.y;
+    });
+    if (!Number.isFinite(mnx) || !Number.isFinite(mxx) || !Number.isFinite(mny) || !Number.isFinite(mxy)) return;
     const pad = 40; 
     const scaleX = (W - pad*2) / (mxx-mnx || 1); 
     const scaleY = (H - pad*2) / (mxy-mny || 1);
@@ -210,6 +218,7 @@ export const Validator: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     ctx.strokeStyle = 'rgba(14, 106, 168, 0.5)';
     ctx.lineWidth = 2;
     conns.forEach(([a,b]) => {
+      if (!Number.isFinite(pts[a].x) || !Number.isFinite(pts[a].y) || !Number.isFinite(pts[b].x) || !Number.isFinite(pts[b].y)) return;
       ctx.beginPath();
       ctx.moveTo(tx(pts[a]), ty(pts[a]));
       ctx.lineTo(tx(pts[b]), ty(pts[b]));
@@ -217,6 +226,7 @@ export const Validator: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     });
 
     pts.forEach((p, i) => {
+      if (!Number.isFinite(p.x) || !Number.isFinite(p.y)) return;
       ctx.beginPath();
       ctx.arc(tx(p), ty(p), 4, 0, Math.PI*2);
       ctx.fillStyle = i < 11 ? '#B74E63' : (i < 23 ? '#0E6AA8' : '#1F8A6D');

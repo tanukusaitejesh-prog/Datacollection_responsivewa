@@ -8,6 +8,20 @@ const COLLECTION_NAME = 'captures';
 
 let cachedClient: MongoClient | null = null;
 
+function decodeNaNPlaceholders(value: unknown): unknown {
+  if (value === 'NaN') return Number.NaN;
+  if (Array.isArray(value)) return value.map(decodeNaNPlaceholders);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+        key,
+        decodeNaNPlaceholders(item),
+      ])
+    );
+  }
+  return value;
+}
+
 async function connectToDatabase() {
   if (cachedClient) {
     return cachedClient;
@@ -51,7 +65,7 @@ export const handler: Handler = async (event) => {
   }
 
   try {
-    const payload = JSON.parse(event.body || '{}');
+    const payload = decodeNaNPlaceholders(JSON.parse(event.body || '{}')) as any;
     const { captureId, ...data } = payload;
 
     if (!captureId || !data.meta) {

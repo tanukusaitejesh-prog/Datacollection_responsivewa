@@ -96,9 +96,9 @@ export class PoseEngine {
         },
         runningMode: "VIDEO",
         numFaces: 1,
-        minFaceDetectionConfidence: 0.4,
-        minFacePresenceConfidence: 0.4,
-        minTrackingConfidence: 0.4,
+        minFaceDetectionConfidence: 0.25,
+        minFacePresenceConfidence: 0.25,
+        minTrackingConfidence: 0.25,
         outputFaceBlendshapes: true
       });
 
@@ -109,9 +109,9 @@ export class PoseEngine {
         },
         runningMode: "VIDEO",
         numHands: 2,
-        minHandDetectionConfidence: 0.4,
-        minHandPresenceConfidence: 0.4,
-        minTrackingConfidence: 0.4
+        minHandDetectionConfidence: 0.25,
+        minHandPresenceConfidence: 0.25,
+        minTrackingConfidence: 0.25
       });
 
       this.isLoaded = true;

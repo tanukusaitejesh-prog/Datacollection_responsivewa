@@ -215,9 +215,9 @@ export function createNpyBuffer(frames: number[][][]): ArrayBuffer {
       const x = frames[t]?.[i]?.[0];
       const y = frames[t]?.[i]?.[1];
       const z = frames[t]?.[i]?.[2];
-      data[base + 0] = isFiniteNumber(x) ? x : 0;
-      data[base + 1] = isFiniteNumber(y) ? y : 0;
-      data[base + 2] = isFiniteNumber(z) ? z : 0;
+      data[base + 0] = isFiniteNumber(x) ? x : Number.NaN;
+      data[base + 1] = isFiniteNumber(y) ? y : Number.NaN;
+      data[base + 2] = isFiniteNumber(z) ? z : Number.NaN;
     }
   }
 

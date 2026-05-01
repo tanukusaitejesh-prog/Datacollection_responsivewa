@@ -33,8 +33,33 @@ type RecordedPoseQuality = Pick<PoseFrameQuality, 'score' | 'averageVisibility' 
   timestampMs: number;
 };
 
-function safeCoord(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+const FACE_LANDMARK_COUNT = 478;
+const HAND_LANDMARK_COUNT = 42;
+
+function coordOrNaN(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : Number.NaN;
+}
+
+function missingPoint(): [number, number, number] {
+  return [Number.NaN, Number.NaN, Number.NaN];
+}
+
+function missingLandmarkFrame(count: number): [number, number, number][] {
+  return Array.from({ length: count }, missingPoint);
+}
+
+function missingLandmarkFrames(frameCount: number, landmarkCount: number): [number, number, number][][] {
+  return Array.from({ length: frameCount }, () => missingLandmarkFrame(landmarkCount));
+}
+
+function missingBlendshapeFrames(frameCount: number): number[][] {
+  return Array.from({ length: frameCount }, () => [Number.NaN]);
+}
+
+function stringifyWithNaN(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => (
+    typeof item === 'number' && Number.isNaN(item) ? 'NaN' : item
+  ));
 }
 
 function average(values: number[]): number | null {
@@ -77,7 +102,7 @@ async function uploadToSupabaseDirect(payload: any, captureId: string) {
     const jsonFileName = `${captureId}/raw_capture.json`;
     const npyFileName = `${captureId}/keypoints.npy`;
     
-    const jsonBlob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    const jsonBlob = new Blob([stringifyWithNaN(payload)], { type: 'application/json' });
     const npyBuffer = createNpyBuffer(payload.keypoints);
     const npyBlob = new Blob([npyBuffer], { type: 'application/octet-stream' });
 
@@ -120,7 +145,7 @@ async function pushToMongoDirect(payload: any, captureId: string) {
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
+      body: stringifyWithNaN({
         captureId,
         ...payload
       }),
@@ -155,6 +180,9 @@ export default function App() {
   const cameraResolutionRef = useRef<[number, number]>([1280, 720]);
   const startTimeRef = useRef<number>(0);
   const isRecordingRef = useRef(false);
+  const captureModeRef = useRef<CaptureMode>('holistic');
+  const faceDetectedFramesRef = useRef(0);
+  const handDetectedFramesRef = useRef(0);
 
   // App State
   const [step, setStep] = useState<Step>('home');
@@ -163,6 +191,8 @@ export default function App() {
   const [isUploading, setIsUploading] = useState(false);
   const [frameCount, setFrameCount] = useState(0);
   const [skippedFrames, setSkippedFrames] = useState(0);
+  const [faceDetectedFrames, setFaceDetectedFrames] = useState(0);
+  const [handDetectedFrames, setHandDetectedFrames] = useState(0);
   const [duration, setDuration] = useState(0);
   const [latestResults, setLatestResults] = useState<PoseLandmarkerResult | null>(null);
   const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
@@ -179,6 +209,10 @@ export default function App() {
   const [captureMode, setCaptureMode] = useState<CaptureMode>('holistic');
   const [showPermissionGuide, setShowPermissionGuide] = useState(false);
   const cameraActive = step === 'testing' || step === 'recording';
+
+  useEffect(() => {
+    captureModeRef.current = captureMode;
+  }, [captureMode]);
 
   useEffect(() => {
     if (cameraActive) {
@@ -247,9 +281,10 @@ export default function App() {
   const startEngineLoop = async () => {
     const loop = async () => {
       if (videoRef.current && engineRef.current) {
+        const useHolistic = captureModeRef.current === 'holistic';
         await engineRef.current.send(videoRef.current, {
-          face: captureMode === 'holistic',
-          hands: captureMode === 'holistic'
+          face: useHolistic,
+          hands: useHolistic
         });
         requestAnimationFrame(loop);
       }
@@ -270,7 +305,7 @@ export default function App() {
 
       const poseLandmarks = results.pose.landmarks[0];
       const frame = poseLandmarks.map((lm: any) => [
-        safeCoord(lm.x), safeCoord(lm.y), safeCoord(lm.z)
+        coordOrNaN(lm.x), coordOrNaN(lm.y), coordOrNaN(lm.z)
       ]);
       const elapsed = Date.now() - startTimeRef.current;
       
@@ -285,23 +320,25 @@ export default function App() {
       });
 
       if (results.face && results.face.faceLandmarks && results.face.faceLandmarks.length > 0) {
-        faceFramesRef.current.push(results.face.faceLandmarks[0].map((lm: any) => [safeCoord(lm.x), safeCoord(lm.y), safeCoord(lm.z)]));
+        faceFramesRef.current.push(results.face.faceLandmarks[0].map((lm: any) => [coordOrNaN(lm.x), coordOrNaN(lm.y), coordOrNaN(lm.z)]));
         faceBlendshapesRef.current.push(results.face.faceBlendshapes?.[0] || []);
+        faceDetectedFramesRef.current += 1;
+        setFaceDetectedFrames(faceDetectedFramesRef.current);
       } else {
-        // Pad with 478 zeros for consistency
-        faceFramesRef.current.push(Array.from({ length: 478 }, () => [0, 0, 0]));
-        faceBlendshapesRef.current.push([]);
+        faceFramesRef.current.push(missingLandmarkFrame(FACE_LANDMARK_COUNT));
+        faceBlendshapesRef.current.push([Number.NaN]);
       }
 
       if (results.hands && results.hands.landmarks && results.hands.landmarks.length > 0) {
         // We want a fixed 42 points (21 per hand). 
-        // If only 1 hand, we pad the rest.
-        const landmarks = results.hands.landmarks.flat().map((lm: any) => [safeCoord(lm.x), safeCoord(lm.y), safeCoord(lm.z)]);
-        while (landmarks.length < 42) landmarks.push([0, 0, 0]);
-        handFramesRef.current.push(landmarks.slice(0, 42));
+        // If only 1 hand, we pad the rest with NaNs.
+        const landmarks = results.hands.landmarks.flat().map((lm: any) => [coordOrNaN(lm.x), coordOrNaN(lm.y), coordOrNaN(lm.z)]);
+        while (landmarks.length < HAND_LANDMARK_COUNT) landmarks.push(missingPoint());
+        handFramesRef.current.push(landmarks.slice(0, HAND_LANDMARK_COUNT));
+        handDetectedFramesRef.current += 1;
+        setHandDetectedFrames(handDetectedFramesRef.current);
       } else {
-        // Pad with 42 zeros
-        handFramesRef.current.push(Array.from({ length: 42 }, () => [0, 0, 0]));
+        handFramesRef.current.push(missingLandmarkFrame(HAND_LANDMARK_COUNT));
       }
 
       timestampsRef.current.push(elapsed);
@@ -318,9 +355,13 @@ export default function App() {
     timestampsRef.current = [];
     poseQualityRef.current = [];
     skippedFramesRef.current = 0;
+    faceDetectedFramesRef.current = 0;
+    handDetectedFramesRef.current = 0;
     startTimeRef.current = Date.now();
     setFrameCount(0);
     setSkippedFrames(0);
+    setFaceDetectedFrames(0);
+    setHandDetectedFrames(0);
     setDuration(0);
     setValidationResult(null);
     isRecordingRef.current = true;
@@ -343,15 +384,20 @@ export default function App() {
     const safeAge = parseInt(age);
     const lastTs = timestampsRef.current[timestampsRef.current.length - 1] || 1;
     const actualFps = framesRef.current.length / (lastTs / 1000);
+    const recordedFrames = framesRef.current.length;
 
     const payload = {
       keypoints: framesRef.current,
       timestamps: timestampsRef.current,
-      face_keypoints: captureMode === 'holistic' ? faceFramesRef.current : [],
-      face_blendshapes: captureMode === 'holistic' ? faceBlendshapesRef.current : [],
-      hand_keypoints: captureMode === 'holistic' ? handFramesRef.current : [],
+      face_keypoints: captureMode === 'holistic' ? faceFramesRef.current : missingLandmarkFrames(recordedFrames, FACE_LANDMARK_COUNT),
+      face_blendshapes: captureMode === 'holistic' ? faceBlendshapesRef.current : missingBlendshapeFrames(recordedFrames),
+      hand_keypoints: captureMode === 'holistic' ? handFramesRef.current : missingLandmarkFrames(recordedFrames, HAND_LANDMARK_COUNT),
       quality: {
         pose: summarizePoseQuality(poseQualityRef.current, skippedFramesRef.current),
+        holistic: {
+          face_detected_frames: faceDetectedFramesRef.current,
+          hand_detected_frames: handDetectedFramesRef.current
+        },
         validation: validationResult
       },
       meta: {
@@ -573,7 +619,7 @@ export default function App() {
               {isRecording && (
                 <>
                   <div className="recording-bar">
-                    REC {(duration/1000).toFixed(1)}s | {frameCount} Frames{skippedFrames > 0 ? ` | ${skippedFrames} skipped` : ''}
+                    REC {(duration/1000).toFixed(1)}s | {frameCount} Frames{captureMode === 'holistic' ? ` | Face ${faceDetectedFrames} | Hands ${handDetectedFrames}` : ''}{skippedFrames > 0 ? ` | ${skippedFrames} skipped` : ''}
                   </div>
 
                   <div className="stop-btn-overlay">
@@ -625,6 +671,9 @@ export default function App() {
               <p className="check-item">Duration: {(duration/1000).toFixed(1)}s</p>
               {skippedFrames > 0 && (
                 <p className="check-item">Skipped low-confidence frames: {skippedFrames}</p>
+              )}
+              {captureMode === 'holistic' && (
+                <p className="check-item">Holistic frames: face {faceDetectedFrames}/{frameCount}, hands {handDetectedFrames}/{frameCount}</p>
               )}
               
               {validationResult && (
