@@ -25,8 +25,27 @@ const SKELETON_EDGES: Array<[number, number]> = [
   [24, 26], [26, 28], [28, 30], [30, 32], [32, 28]
 ];
 
+const DRAW_VISIBILITY_THRESHOLD = 0.12;
+
 function clamp(value: number, minValue: number, maxValue: number): number {
   return Math.max(minValue, Math.min(maxValue, value));
+}
+
+function landmarkVisibility(lm: any): number {
+  return Number.isFinite(lm?.visibility) ? lm.visibility : 0;
+}
+
+function isDrawableLandmark(lm: any): boolean {
+  return (
+    Number.isFinite(lm?.x) &&
+    Number.isFinite(lm?.y) &&
+    Number.isFinite(lm?.z) &&
+    landmarkVisibility(lm) >= DRAW_VISIBILITY_THRESHOLD &&
+    lm.x >= -0.2 &&
+    lm.x <= 1.2 &&
+    lm.y >= -0.2 &&
+    lm.y <= 1.2
+  );
 }
 
 function zToColor(z: number): string {
@@ -60,13 +79,13 @@ export class PoseEngine {
       
       this.poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
         baseOptions: {
-          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task`,
+          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task`,
           delegate: "GPU"
         },
         runningMode: "VIDEO",
         numPoses: 1,
-        minPoseDetectionConfidence: 0.5,
-        minPosePresenceConfidence: 0.5,
+        minPoseDetectionConfidence: 0.35,
+        minPosePresenceConfidence: 0.45,
         minTrackingConfidence: 0.5
       });
 
@@ -144,8 +163,8 @@ export class PoseEngine {
       SKELETON_EDGES.forEach(([from, to]) => {
         const p1 = landmarks[from];
         const p2 = landmarks[to];
-        if (p1 && p2) {
-          const alpha = clamp(((p1.visibility ?? 0) + (p2.visibility ?? 0)) * 0.5, 0.15, 1);
+        if (p1 && p2 && isDrawableLandmark(p1) && isDrawableLandmark(p2)) {
+          const alpha = clamp((landmarkVisibility(p1) + landmarkVisibility(p2)) * 0.5, 0.2, 1);
           ctx.beginPath();
           ctx.moveTo(p1.x * width, p1.y * height);
           ctx.lineTo(p2.x * width, p2.y * height);
@@ -157,10 +176,11 @@ export class PoseEngine {
 
       // Draw All Joints
       landmarks.forEach((lm) => {
+        if (!isDrawableLandmark(lm)) return;
 
         const x = lm.x * width;
         const y = lm.y * height;
-        const radius = 2 + (lm.visibility ?? 0) * 3;
+        const radius = 2 + landmarkVisibility(lm) * 3;
 
         ctx.beginPath();
         ctx.arc(x, y, radius, 0, 2 * Math.PI);

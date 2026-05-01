@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { PoseEngine } from './lib/pose-engine';
 import { 
   Square, 
@@ -14,7 +14,7 @@ import {
 } from 'lucide-react';
 import { PoseLandmarkerResult } from '@mediapipe/tasks-vision';
 import { supabase } from './lib/supabase';
-import { evaluateCaptureReadiness } from './lib/quality';
+import { analyzePoseFrame, evaluateCaptureReadiness, type PoseFrameQuality } from './lib/quality';
 import { validatePoseData, ValidationResult, createNpyBuffer } from './lib/validator-utils';
 import { Validator } from './Validator';
 
@@ -29,6 +29,48 @@ type Gender = (typeof GENDER_OPTIONS)[number]['value'];
 type Step = 'home' | 'testing' | 'recording' | 'confirm' | 'validator';
 type CameraFacing = 'user' | 'environment';
 type CaptureMode = 'pose_only' | 'holistic';
+type RecordedPoseQuality = Pick<PoseFrameQuality, 'score' | 'averageVisibility' | 'reliableLandmarks' | 'inFrameLandmarks' | 'bodyBoxArea'> & {
+  timestampMs: number;
+};
+
+function safeCoord(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+function average(values: number[]): number | null {
+  return values.length > 0 ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+}
+
+function minimum(values: number[]): number | null {
+  return values.length > 0 ? Math.min(...values) : null;
+}
+
+function roundMetric(value: number | null, digits = 3): number | null {
+  return value === null ? null : Number(value.toFixed(digits));
+}
+
+function summarizePoseQuality(samples: RecordedPoseQuality[], skippedFrames: number) {
+  const scores = samples.map(sample => sample.score);
+  const visibility = samples.map(sample => sample.averageVisibility);
+  const reliable = samples.map(sample => sample.reliableLandmarks);
+  const inFrame = samples.map(sample => sample.inFrameLandmarks);
+  const boxAreas = samples.map(sample => sample.bodyBoxArea);
+
+  return {
+    accepted_frames: samples.length,
+    skipped_frames: skippedFrames,
+    mean_score: roundMetric(average(scores), 1),
+    min_score: roundMetric(minimum(scores), 1),
+    mean_visibility: roundMetric(average(visibility)),
+    min_visibility: roundMetric(minimum(visibility)),
+    mean_reliable_landmarks: roundMetric(average(reliable), 1),
+    min_reliable_landmarks: roundMetric(minimum(reliable), 1),
+    mean_in_frame_landmarks: roundMetric(average(inFrame), 1),
+    min_in_frame_landmarks: roundMetric(minimum(inFrame), 1),
+    mean_body_box_area: roundMetric(average(boxAreas), 4),
+    min_body_box_area: roundMetric(minimum(boxAreas), 4)
+  };
+}
 
 async function uploadToSupabaseDirect(payload: any, captureId: string) {
   try {
@@ -108,7 +150,11 @@ export default function App() {
   const handFramesRef = useRef<number[][][]>([]);
   const faceBlendshapesRef = useRef<any[]>([]);
   const timestampsRef = useRef<number[]>([]);
+  const poseQualityRef = useRef<RecordedPoseQuality[]>([]);
+  const skippedFramesRef = useRef(0);
+  const cameraResolutionRef = useRef<[number, number]>([1280, 720]);
   const startTimeRef = useRef<number>(0);
+  const isRecordingRef = useRef(false);
 
   // App State
   const [step, setStep] = useState<Step>('home');
@@ -116,9 +162,11 @@ export default function App() {
   const [isRecording, setIsRecording] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
   const [frameCount, setFrameCount] = useState(0);
+  const [skippedFrames, setSkippedFrames] = useState(0);
   const [duration, setDuration] = useState(0);
   const [latestResults, setLatestResults] = useState<PoseLandmarkerResult | null>(null);
   const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
+  const [cameraAspect, setCameraAspect] = useState('16 / 9');
 
   // Metadata State
   const [sessionId, setSessionId] = useState('');
@@ -130,17 +178,19 @@ export default function App() {
   const [cameraFacing, setCameraFacing] = useState<CameraFacing>('user');
   const [captureMode, setCaptureMode] = useState<CaptureMode>('holistic');
   const [showPermissionGuide, setShowPermissionGuide] = useState(false);
+  const cameraActive = step === 'testing' || step === 'recording';
 
   useEffect(() => {
-    if (step === 'testing' || step === 'recording') {
+    if (cameraActive) {
       initCamera();
     }
     return () => {
       stopCamera();
     };
-  }, [step, cameraFacing]);
+  }, [cameraActive, cameraFacing]);
 
   const stopCamera = () => {
+    isRecordingRef.current = false;
     if (videoRef.current && videoRef.current.srcObject) {
       const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
       tracks.forEach(track => track.stop());
@@ -148,6 +198,7 @@ export default function App() {
     engineRef.current?.close();
     engineRef.current = null;
     setIsReady(false);
+    setLatestResults(null);
   };
 
   const initCamera = async () => {
@@ -172,6 +223,14 @@ export default function App() {
       engineRef.current = engine;
 
       videoRef.current.onloadedmetadata = () => {
+        const videoWidth = videoRef.current?.videoWidth || 1280;
+        const videoHeight = videoRef.current?.videoHeight || 720;
+        cameraResolutionRef.current = [videoWidth, videoHeight];
+        setCameraAspect(`${videoWidth} / ${videoHeight}`);
+        if (canvasRef.current) {
+          canvasRef.current.width = videoWidth;
+          canvasRef.current.height = videoHeight;
+        }
         setIsReady(true);
         startEngineLoop();
       };
@@ -200,36 +259,51 @@ export default function App() {
 
   const handlePoseResults = (results: any) => {
     setLatestResults(results.pose);
-    
-    if (isRecording && results.pose && results.pose.landmarks && results.pose.landmarks.length > 0) {
+    const poseQuality = analyzePoseFrame(results.pose);
+
+    if (isRecordingRef.current) {
+      if (!poseQuality.usable || !results.pose?.landmarks?.length) {
+        skippedFramesRef.current += 1;
+        setSkippedFrames(skippedFramesRef.current);
+        return;
+      }
+
       const poseLandmarks = results.pose.landmarks[0];
       const frame = poseLandmarks.map((lm: any) => [
-        lm.x, lm.y, lm.z
+        safeCoord(lm.x), safeCoord(lm.y), safeCoord(lm.z)
       ]);
+      const elapsed = Date.now() - startTimeRef.current;
       
       framesRef.current.push(frame);
+      poseQualityRef.current.push({
+        score: poseQuality.score,
+        averageVisibility: poseQuality.averageVisibility,
+        reliableLandmarks: poseQuality.reliableLandmarks,
+        inFrameLandmarks: poseQuality.inFrameLandmarks,
+        bodyBoxArea: poseQuality.bodyBoxArea,
+        timestampMs: elapsed
+      });
 
       if (results.face && results.face.faceLandmarks && results.face.faceLandmarks.length > 0) {
-        faceFramesRef.current.push(results.face.faceLandmarks[0].map((lm: any) => [lm.x, lm.y, lm.z]));
+        faceFramesRef.current.push(results.face.faceLandmarks[0].map((lm: any) => [safeCoord(lm.x), safeCoord(lm.y), safeCoord(lm.z)]));
         faceBlendshapesRef.current.push(results.face.faceBlendshapes?.[0] || []);
       } else {
         // Pad with 478 zeros for consistency
-        faceFramesRef.current.push(Array(478).fill([0, 0, 0]));
+        faceFramesRef.current.push(Array.from({ length: 478 }, () => [0, 0, 0]));
         faceBlendshapesRef.current.push([]);
       }
 
       if (results.hands && results.hands.landmarks && results.hands.landmarks.length > 0) {
         // We want a fixed 42 points (21 per hand). 
         // If only 1 hand, we pad the rest.
-        const landmarks = results.hands.landmarks.flat().map((lm: any) => [lm.x, lm.y, lm.z]);
+        const landmarks = results.hands.landmarks.flat().map((lm: any) => [safeCoord(lm.x), safeCoord(lm.y), safeCoord(lm.z)]);
         while (landmarks.length < 42) landmarks.push([0, 0, 0]);
         handFramesRef.current.push(landmarks.slice(0, 42));
       } else {
         // Pad with 42 zeros
-        handFramesRef.current.push(Array(42).fill([0, 0, 0]));
+        handFramesRef.current.push(Array.from({ length: 42 }, () => [0, 0, 0]));
       }
 
-      const elapsed = Date.now() - startTimeRef.current;
       timestampsRef.current.push(elapsed);
       setFrameCount(framesRef.current.length);
       setDuration(elapsed);
@@ -242,14 +316,20 @@ export default function App() {
     handFramesRef.current = [];
     faceBlendshapesRef.current = [];
     timestampsRef.current = [];
+    poseQualityRef.current = [];
+    skippedFramesRef.current = 0;
     startTimeRef.current = Date.now();
     setFrameCount(0);
+    setSkippedFrames(0);
     setDuration(0);
+    setValidationResult(null);
+    isRecordingRef.current = true;
     setIsRecording(true);
     setStep('recording');
   };
 
   const stopRecording = () => {
+    isRecordingRef.current = false;
     setIsRecording(false);
     const result = validatePoseData(framesRef.current);
     setValidationResult(result);
@@ -270,10 +350,14 @@ export default function App() {
       face_keypoints: captureMode === 'holistic' ? faceFramesRef.current : [],
       face_blendshapes: captureMode === 'holistic' ? faceBlendshapesRef.current : [],
       hand_keypoints: captureMode === 'holistic' ? handFramesRef.current : [],
+      quality: {
+        pose: summarizePoseQuality(poseQualityRef.current, skippedFramesRef.current),
+        validation: validationResult
+      },
       meta: {
         capture_mode: captureMode,
         fps_nominal: isFinite(actualFps) ? actualFps : 30,
-        resolution: [1280, 720],
+        resolution: cameraResolutionRef.current,
         device: 'Web Chrome',
         camera_facing: cameraFacing,
         session_id: sessionId || `web_${Date.now()}`,
@@ -343,7 +427,7 @@ export default function App() {
       const res = await fetch('/.netlify/functions/pushToMongo');
       const data = await res.json();
       if (res.ok) {
-        alert('MongoDB Connection Successful! ??');
+        alert('MongoDB Connection Successful!');
       } else {
         alert(`MongoDB Connection Failed!\nReason: ${data.error || data.message}`);
       }
@@ -358,6 +442,8 @@ export default function App() {
   };
 
   const readiness = evaluateCaptureReadiness(latestResults, isReady);
+  const uploadBlocked = validationResult?.overall === 'fail';
+  const cameraSurfaceStyle = { '--camera-aspect': cameraAspect } as CSSProperties;
 
   return (
     <div className="app-root">
@@ -369,7 +455,7 @@ export default function App() {
 
             <div className="card">
               <div className="card-title">Subject Profile</div>
-              <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10}}>
+              <div className="form-grid">
                 <div>
                   <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Full Name</label>
                   <input className="input-field" value={subjectName} onChange={e => setSubjectName(e.target.value)} placeholder="Name" />
@@ -380,14 +466,14 @@ export default function App() {
                 </div>
               </div>
 
-              <div style={{marginTop: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10}}>
+              <div className="form-grid form-grid-spaced">
                 <div>
                   <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Age</label>
                   <input type="number" className="input-field" value={age} onChange={e => setAge(e.target.value)} placeholder="Age" />
                 </div>
                 <div>
                   <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Action Type</label>
-                  <input className="input-field" value={actionType} onChange={e => setActionType(e.target.value)} placeholder="e.g. Walking" />
+                  <input className="input-field" value={actionType} onChange={e => setActionType(e.target.value)} placeholder="e.g. sit, stand, reach, turn" />
                 </div>
               </div>
 
@@ -466,10 +552,10 @@ export default function App() {
         <Validator onBack={() => setStep('home')} />
       )}
 
-      {step === 'testing' && (
-        <div className="app-container">
-          <div className="step-container">
-            <div className="camera-wrapper">
+      {cameraActive && (
+        <div className={`app-container ${isRecording ? 'capture-app-container' : ''}`}>
+          <div className={`step-container ${isRecording ? 'capture-step-container' : ''}`}>
+            <div className={`camera-wrapper ${isRecording ? 'recording-camera-wrapper' : ''}`} style={cameraSurfaceStyle}>
               <video 
                 ref={videoRef} 
                 className={`camera-stream ${cameraFacing === 'environment' ? 'back' : ''}`} 
@@ -483,57 +569,46 @@ export default function App() {
               <button className="flip-btn" onClick={toggleCamera}>
                 <FlipHorizontal size={20} />
               </button>
+
+              {isRecording && (
+                <>
+                  <div className="recording-bar">
+                    REC {(duration/1000).toFixed(1)}s | {frameCount} Frames{skippedFrames > 0 ? ` | ${skippedFrames} skipped` : ''}
+                  </div>
+
+                  <div className="stop-btn-overlay">
+                    <button className="btn btn-danger" onClick={stopRecording}>
+                      <Square size={20} fill="currentColor" /> Stop Recording
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
 
-            <div className="testing-panel">
-              <div className="card-title">Pre-Capture Check</div>
-              {readiness.checks.map(c => (
-                <p key={c.id} className={`check-item ${c.ok ? 'check-ok' : 'check-fail'}`}>
-                  {c.ok ? '??' : '??'} {c.label}: {c.detail}
-                </p>
-              ))}
-              <p style={{marginTop: 8, fontWeight: 700, fontSize: 13, color: readiness.ready ? 'var(--success)' : 'var(--error)'}}>
-                {readiness.summary}
-              </p>
-            </div>
+            {!isRecording && (
+              <>
+                <div className="testing-panel">
+                  <div className="card-title">Pre-Capture Check</div>
+                  {readiness.checks.map(c => (
+                    <p key={c.id} className={`check-item ${c.ok ? 'check-ok' : 'check-fail'}`}>
+                      {c.ok ? 'OK' : 'WAIT'} {c.label}: {c.detail}
+                    </p>
+                  ))}
+                  <p style={{marginTop: 8, fontWeight: 700, fontSize: 13, color: readiness.ready ? 'var(--success)' : 'var(--error)'}}>
+                    {readiness.summary}
+                  </p>
+                </div>
 
-            <div style={{display: 'flex', gap: 10, marginTop: 'auto', paddingBottom: 20}}>
-              <button className="btn btn-secondary" onClick={() => setStep('home')}>
-                <ArrowLeft size={18} /> Back
-              </button>
-              <button className="btn btn-primary" disabled={!readiness.ready} onClick={startRecording}>
-                Start Recording
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {step === 'recording' && (
-        <div className="app-container" style={{maxWidth: 'none', padding: 0}}>
-          <div className="step-container" style={{padding: 0, height: '100vh', position: 'relative'}}>
-            <div className="camera-wrapper" style={{height: '100%', borderRadius: 0, margin: 0}}>
-              <video 
-                ref={videoRef} 
-                className={`camera-stream ${cameraFacing === 'environment' ? 'back' : ''}`} 
-                autoPlay playsInline muted 
-              />
-              <canvas 
-                ref={canvasRef} 
-                className={`landmark-canvas ${cameraFacing === 'environment' ? 'back' : ''}`} 
-                width={1280} height={720} 
-              />
-              
-              <div className="recording-bar">
-                REC {(duration/1000).toFixed(1)}s | {frameCount} Frames
-              </div>
-
-              <div className="stop-btn-overlay">
-                <button className="btn btn-danger" onClick={stopRecording}>
-                  <Square size={20} fill="currentColor" /> Stop Recording
-                </button>
-              </div>
-            </div>
+                <div className="button-row">
+                  <button className="btn btn-secondary" onClick={() => setStep('home')}>
+                    <ArrowLeft size={18} /> Back
+                  </button>
+                  <button className="btn btn-primary" disabled={!readiness.ready} onClick={startRecording}>
+                    Start Recording
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -548,6 +623,9 @@ export default function App() {
               <div className="card-title">Captured Data</div>
               <p className="check-item">Frames: {frameCount} ({ (frameCount/(duration/1000 || 1)).toFixed(1) } FPS)</p>
               <p className="check-item">Duration: {(duration/1000).toFixed(1)}s</p>
+              {skippedFrames > 0 && (
+                <p className="check-item">Skipped low-confidence frames: {skippedFrames}</p>
+              )}
               
               {validationResult && (
                 <div style={{ 
@@ -566,17 +644,22 @@ export default function App() {
                       {validationResult.overall === 'pass' ? 'Training Ready' : validationResult.overall === 'warn' ? 'Usable (Warnings)' : 'Quality Issue'}
                     </div>
                     <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
-                      {validationResult.overall === 'pass' ? 'Meets all ASD-MTD requirements.' : validationResult.overall === 'warn' ? `${validationResult.warns} warnings detected.` : `${validationResult.fails} critical errors.`}
+                      {validationResult.overall === 'pass' ? 'Meets capture quality checks.' : validationResult.overall === 'warn' ? `${validationResult.warns} warnings detected.` : `${validationResult.fails} critical errors. Record again before uploading.`}
                     </div>
                   </div>
                 </div>
+              )}
+              {uploadBlocked && (
+                <p className="check-item check-fail" style={{ marginTop: 10 }}>
+                  Upload is disabled because this capture failed quality checks.
+                </p>
               )}
             </div>
 
             <div className="card">
               <div className="card-title">Edit Metadata</div>
               
-              <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10}}>
+              <div className="form-grid">
                 <div>
                   <label style={{fontSize: 10, fontWeight: 700}}>Name</label>
                   <input className="input-field" value={subjectName} onChange={e => setSubjectName(e.target.value)} />
@@ -587,7 +670,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div style={{marginTop: 8, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10}}>
+              <div className="form-grid form-grid-compact">
                 <div>
                   <label style={{fontSize: 10, fontWeight: 700}}>Age</label>
                   <input type="number" className="input-field" value={age} onChange={e => setAge(e.target.value)} />
@@ -603,7 +686,7 @@ export default function App() {
               <div style={{display: 'flex', flexDirection: 'column', gap: 10}}>
                 <button 
                   className="btn btn-primary" 
-                  disabled={isUploading}
+                  disabled={isUploading || uploadBlocked}
                   onClick={() => handleFinalize('supabase')}
                 >
                   {isUploading ? <RefreshCw className="animate-spin" /> : <UploadCloud />}
@@ -612,7 +695,7 @@ export default function App() {
                 <button 
                   className="btn btn-primary" 
                   style={{ backgroundColor: '#47A248' }} // MongoDB green color
-                  disabled={isUploading}
+                  disabled={isUploading || uploadBlocked}
                   onClick={() => handleFinalize('mongo')}
                 >
                   {isUploading ? <RefreshCw className="animate-spin" /> : <UploadCloud />}
@@ -624,7 +707,7 @@ export default function App() {
                     background: 'linear-gradient(135deg, var(--accent) 0%, #47A248 100%)',
                     boxShadow: '0 4px 15px rgba(14, 106, 168, 0.2)'
                   }}
-                  disabled={isUploading}
+                  disabled={isUploading || uploadBlocked}
                   onClick={() => handleFinalize('both')}
                 >
                   {isUploading ? <RefreshCw className="animate-spin" /> : <RefreshCw />}

@@ -17,28 +17,47 @@
   padding: 0;
 }
 
+html {
+  width: 100%;
+  min-height: 100%;
+}
+
 body {
   font-family: var(--font-family);
   background-color: var(--bg-primary);
   color: var(--text-primary);
   overflow-x: hidden;
+  min-width: 0;
+}
+
+button,
+input {
+  font: inherit;
+  min-width: 0;
+}
+
+.app-root {
+  min-height: 100vh;
+  min-height: 100dvh;
+  width: 100%;
 }
 
 .app-container {
   width: 100%;
-  max-width: 600px;
+  max-width: min(100%, 640px);
   margin: 0 auto;
   min-height: 100vh;
+  min-height: 100dvh;
   display: flex;
   flex-direction: column;
-  padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom) 0;
+  padding: env(safe-area-inset-top) clamp(10px, 3vw, 20px) env(safe-area-inset-bottom);
 }
 
 @media (min-width: 1024px) {
   .app-container {
-    max-width: 800px;
-    padding-top: 40px;
-    padding-bottom: 40px;
+    max-width: min(100%, 840px);
+    padding-top: clamp(24px, 4vh, 40px);
+    padding-bottom: clamp(24px, 4vh, 40px);
   }
 }
 
@@ -47,9 +66,10 @@ body {
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: 14px;
-  padding: 16px;
+  padding: clamp(12px, 2.4vw, 16px);
   margin-bottom: 12px;
   box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+  min-width: 0;
 }
 
 .card-title {
@@ -75,6 +95,26 @@ body {
 .input-field:focus {
   border-color: var(--accent);
   background: white;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.form-grid-spaced {
+  margin-top: 12px;
+}
+
+.form-grid-compact {
+  margin-top: 8px;
+}
+
+@media (max-width: 560px) {
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* CHIPS */
@@ -144,7 +184,8 @@ body {
 .camera-wrapper {
   position: relative;
   width: 100%;
-  aspect-ratio: 4/3;
+  max-width: 100%;
+  aspect-ratio: var(--camera-aspect, 16 / 9);
   background: #000;
   border-radius: 12px;
   overflow: hidden;
@@ -154,18 +195,18 @@ body {
 
 @media (max-width: 480px) {
   .camera-wrapper {
-    aspect-ratio: 3/4; /* More vertical on small phones */
     border-radius: 0;
-    margin-left: -16px;
-    margin-right: -16px;
-    width: calc(100% + 32px);
+    width: 100%;
   }
 }
 
 .camera-stream {
+  position: absolute;
+  inset: 0;
+  display: block;
   width: 100%;
   height: 100%;
-  object-fit: cover;
+  object-fit: contain;
   transform: scaleX(-1); /* Mirror by default */
 }
 
@@ -176,16 +217,33 @@ body {
 
 .landmark-canvas {
   position: absolute;
-  top: 0;
-  left: 0;
+  inset: 0;
+  display: block;
   width: 100%;
   height: 100%;
+  object-fit: contain;
   pointer-events: none;
   transform: scaleX(-1); /* Mirror to match camera-stream */
 }
 
 .landmark-canvas.back {
   transform: none;
+}
+
+.recording-camera-wrapper {
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  max-width: none;
+  aspect-ratio: auto;
+  border-radius: 0;
+  margin: 0;
+  box-shadow: none;
+}
+
+.capture-app-container {
+  max-width: none;
+  padding: 0;
 }
 
 .flip-btn {
@@ -234,10 +292,18 @@ body {
 
 /* STEPS */
 .step-container {
-  padding: 16px;
+  padding: clamp(10px, 3vw, 16px) 0;
   display: flex;
   flex-direction: column;
   flex: 1;
+  min-width: 0;
+}
+
+.step-container.capture-step-container {
+  padding: 0;
+  min-height: 100vh;
+  min-height: 100dvh;
+  position: relative;
 }
 
 .home-title {
@@ -258,6 +324,36 @@ body {
   padding: 12px;
   border-radius: 12px;
   border: 1px solid var(--border);
+}
+
+.button-row {
+  display: flex;
+  gap: 10px;
+  margin-top: auto;
+  padding-bottom: 20px;
+}
+
+.button-row > .btn {
+  min-width: 0;
+}
+
+@media (max-width: 420px) {
+  .button-row {
+    flex-direction: column;
+  }
+
+  .recording-bar {
+    max-width: calc(100vw - 24px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-size: 12px;
+  }
+
+  .stop-btn-overlay {
+    left: 12px;
+    right: 12px;
+    bottom: max(20px, env(safe-area-inset-bottom));
+  }
 }
 
 .check-item {
