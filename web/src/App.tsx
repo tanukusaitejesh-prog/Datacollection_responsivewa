@@ -56,6 +56,34 @@ function missingBlendshapeFrames(frameCount: number): number[][] {
   return Array.from({ length: frameCount }, () => [Number.NaN]);
 }
 
+function normalizeLandmarkFrame(frame: number[][] | undefined, landmarkCount: number): [number, number, number][] {
+  return Array.from({ length: landmarkCount }, (_, index) => {
+    const point = frame?.[index];
+    return [
+      coordOrNaN(point?.[0]),
+      coordOrNaN(point?.[1]),
+      coordOrNaN(point?.[2])
+    ];
+  });
+}
+
+function normalizeLandmarkFrames(
+  frames: number[][][],
+  frameCount: number,
+  landmarkCount: number
+): [number, number, number][][] {
+  return Array.from({ length: frameCount }, (_, index) => (
+    normalizeLandmarkFrame(frames[index], landmarkCount)
+  ));
+}
+
+function normalizeBlendshapeFrames(frames: any[], frameCount: number): any[] {
+  return Array.from({ length: frameCount }, (_, index) => {
+    const frame = frames[index];
+    return Array.isArray(frame) && frame.length > 0 ? frame : [Number.NaN];
+  });
+}
+
 function stringifyWithNaN(value: unknown): string {
   return JSON.stringify(value, (_key, item) => (
     typeof item === 'number' && Number.isNaN(item) ? 'NaN' : item
@@ -181,6 +209,7 @@ export default function App() {
   const startTimeRef = useRef<number>(0);
   const isRecordingRef = useRef(false);
   const captureModeRef = useRef<CaptureMode>('holistic');
+  const recordingCaptureModeRef = useRef<CaptureMode>('holistic');
   const faceDetectedFramesRef = useRef(0);
   const handDetectedFramesRef = useRef(0);
 
@@ -319,9 +348,11 @@ export default function App() {
         timestampMs: elapsed
       });
 
-      if (results.face && results.face.faceLandmarks && results.face.faceLandmarks.length > 0) {
-        faceFramesRef.current.push(results.face.faceLandmarks[0].map((lm: any) => [coordOrNaN(lm.x), coordOrNaN(lm.y), coordOrNaN(lm.z)]));
-        faceBlendshapesRef.current.push(results.face.faceBlendshapes?.[0] || []);
+      const faceLandmarks = results.face?.faceLandmarks?.[0];
+      if (Array.isArray(faceLandmarks) && faceLandmarks.length > 0) {
+        const faceFrame = faceLandmarks.map((lm: any) => [coordOrNaN(lm.x), coordOrNaN(lm.y), coordOrNaN(lm.z)]);
+        faceFramesRef.current.push(normalizeLandmarkFrame(faceFrame, FACE_LANDMARK_COUNT));
+        faceBlendshapesRef.current.push(results.face.faceBlendshapes?.[0] || [Number.NaN]);
         faceDetectedFramesRef.current += 1;
         setFaceDetectedFrames(faceDetectedFramesRef.current);
       } else {
@@ -334,7 +365,7 @@ export default function App() {
         // If only 1 hand, we pad the rest with NaNs.
         const landmarks = results.hands.landmarks.flat().map((lm: any) => [coordOrNaN(lm.x), coordOrNaN(lm.y), coordOrNaN(lm.z)]);
         while (landmarks.length < HAND_LANDMARK_COUNT) landmarks.push(missingPoint());
-        handFramesRef.current.push(landmarks.slice(0, HAND_LANDMARK_COUNT));
+        handFramesRef.current.push(normalizeLandmarkFrame(landmarks.slice(0, HAND_LANDMARK_COUNT), HAND_LANDMARK_COUNT));
         handDetectedFramesRef.current += 1;
         setHandDetectedFrames(handDetectedFramesRef.current);
       } else {
@@ -364,6 +395,7 @@ export default function App() {
     setHandDetectedFrames(0);
     setDuration(0);
     setValidationResult(null);
+    recordingCaptureModeRef.current = captureModeRef.current;
     isRecordingRef.current = true;
     setIsRecording(true);
     setStep('recording');
@@ -385,23 +417,30 @@ export default function App() {
     const lastTs = timestampsRef.current[timestampsRef.current.length - 1] || 1;
     const actualFps = framesRef.current.length / (lastTs / 1000);
     const recordedFrames = framesRef.current.length;
+    const recordedMode = recordingCaptureModeRef.current;
+    const faceKeypoints = normalizeLandmarkFrames(faceFramesRef.current, recordedFrames, FACE_LANDMARK_COUNT);
+    const handKeypoints = normalizeLandmarkFrames(handFramesRef.current, recordedFrames, HAND_LANDMARK_COUNT);
+    const faceBlendshapes = normalizeBlendshapeFrames(faceBlendshapesRef.current, recordedFrames);
 
     const payload = {
       keypoints: framesRef.current,
       timestamps: timestampsRef.current,
-      face_keypoints: captureMode === 'holistic' ? faceFramesRef.current : missingLandmarkFrames(recordedFrames, FACE_LANDMARK_COUNT),
-      face_blendshapes: captureMode === 'holistic' ? faceBlendshapesRef.current : missingBlendshapeFrames(recordedFrames),
-      hand_keypoints: captureMode === 'holistic' ? handFramesRef.current : missingLandmarkFrames(recordedFrames, HAND_LANDMARK_COUNT),
+      face_keypoints: recordedMode === 'holistic' ? faceKeypoints : missingLandmarkFrames(recordedFrames, FACE_LANDMARK_COUNT),
+      face_blendshapes: recordedMode === 'holistic' ? faceBlendshapes : missingBlendshapeFrames(recordedFrames),
+      hand_keypoints: recordedMode === 'holistic' ? handKeypoints : missingLandmarkFrames(recordedFrames, HAND_LANDMARK_COUNT),
       quality: {
         pose: summarizePoseQuality(poseQualityRef.current, skippedFramesRef.current),
         holistic: {
           face_detected_frames: faceDetectedFramesRef.current,
-          hand_detected_frames: handDetectedFramesRef.current
+          hand_detected_frames: handDetectedFramesRef.current,
+          saved_face_frames: recordedMode === 'holistic' ? faceKeypoints.length : recordedFrames,
+          saved_hand_frames: recordedMode === 'holistic' ? handKeypoints.length : recordedFrames,
+          expected_frames: recordedFrames
         },
         validation: validationResult
       },
       meta: {
-        capture_mode: captureMode,
+        capture_mode: recordedMode,
         fps_nominal: isFinite(actualFps) ? actualFps : 30,
         resolution: cameraResolutionRef.current,
         device: 'Web Chrome',
@@ -490,6 +529,7 @@ export default function App() {
   const readiness = evaluateCaptureReadiness(latestResults, isReady);
   const uploadBlocked = validationResult?.overall === 'fail';
   const cameraSurfaceStyle = { '--camera-aspect': cameraAspect } as CSSProperties;
+  const recordedCaptureMode = recordingCaptureModeRef.current;
 
   return (
     <div className="app-root">
@@ -672,8 +712,11 @@ export default function App() {
               {skippedFrames > 0 && (
                 <p className="check-item">Skipped low-confidence frames: {skippedFrames}</p>
               )}
-              {captureMode === 'holistic' && (
+              {recordedCaptureMode === 'holistic' && (
                 <p className="check-item">Holistic frames: face {faceDetectedFrames}/{frameCount}, hands {handDetectedFrames}/{frameCount}</p>
+              )}
+              {recordedCaptureMode === 'holistic' && (
+                <p className="check-item">Saved arrays: face {faceFramesRef.current.length}/{frameCount}, hands {handFramesRef.current.length}/{frameCount}</p>
               )}
               
               {validationResult && (

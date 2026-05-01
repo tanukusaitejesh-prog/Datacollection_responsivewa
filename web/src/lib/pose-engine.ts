@@ -1,7 +1,7 @@
 import { 
-  PoseLandmarker, FaceLandmarker, HandLandmarker, 
+  PoseLandmarker, FaceLandmarker, HandLandmarker, HolisticLandmarker,
   FilesetResolver, 
-  PoseLandmarkerResult, FaceLandmarkerResult, HandLandmarkerResult 
+  PoseLandmarkerResult, FaceLandmarkerResult, HandLandmarkerResult, HolisticLandmarkerResult
 } from '@mediapipe/tasks-vision';
 
 export type HolisticCallback = (results: {
@@ -59,6 +59,7 @@ export class PoseEngine {
   private poseLandmarker: PoseLandmarker | null = null;
   private faceLandmarker: FaceLandmarker | null = null;
   private handLandmarker: HandLandmarker | null = null;
+  private holisticLandmarker: HolisticLandmarker | null = null;
   
   private canvasElement: HTMLCanvasElement;
   private canvasCtx: CanvasRenderingContext2D;
@@ -114,6 +115,24 @@ export class PoseEngine {
         minTrackingConfidence: 0.25
       });
 
+      try {
+        this.holisticLandmarker = await HolisticLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath: `https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/1/hand_landmark.task`,
+            delegate: "GPU"
+          },
+          runningMode: "VIDEO",
+          minFaceDetectionConfidence: 0.25,
+          minFacePresenceConfidence: 0.25,
+          outputFaceBlendshapes: true,
+          minPoseDetectionConfidence: 0.35,
+          minPosePresenceConfidence: 0.45,
+          minHandLandmarksConfidence: 0.25
+        });
+      } catch (err) {
+        console.warn("Holistic Landmarker unavailable; using separate face/hand detectors.", err);
+      }
+
       this.isLoaded = true;
       console.log("Pose Landmarker initialized");
     } catch (err) {
@@ -128,6 +147,12 @@ export class PoseEngine {
   public async send(video: HTMLVideoElement, options: { face: boolean; hands: boolean } = { face: true, hands: true }) {
     if (!this.poseLandmarker || !this.isLoaded) return;
     const startTimeMs = performance.now();
+
+    if ((options.face || options.hands) && this.holisticLandmarker) {
+      const holisticResult = this.holisticLandmarker.detectForVideo(video, startTimeMs);
+      this.handleResults(this.convertHolisticResult(holisticResult));
+      return;
+    }
     
     // MediaPipe detectForVideo is synchronous, so we don't need Promise.all
     // but we can still run them conditionally
@@ -144,6 +169,39 @@ export class PoseEngine {
     }
     
     this.handleResults({ pose: poseResult, face: faceResult, hands: handResult });
+  }
+
+  private convertHolisticResult(result: HolisticLandmarkerResult): {
+    pose: PoseLandmarkerResult | null;
+    face: FaceLandmarkerResult | null;
+    hands: HandLandmarkerResult | null;
+  } {
+    const pose = {
+      landmarks: result.poseLandmarks || [],
+      worldLandmarks: result.poseWorldLandmarks || [],
+      segmentationMasks: result.poseSegmentationMasks || [],
+      close: () => {}
+    } as unknown as PoseLandmarkerResult;
+
+    const face = {
+      faceLandmarks: result.faceLandmarks || [],
+      faceBlendshapes: result.faceBlendshapes || [],
+      facialTransformationMatrixes: []
+    } as FaceLandmarkerResult;
+
+    const leftHands = result.leftHandLandmarks || [];
+    const rightHands = result.rightHandLandmarks || [];
+    const hands = {
+      landmarks: [...leftHands, ...rightHands],
+      worldLandmarks: [
+        ...(result.leftHandWorldLandmarks || []),
+        ...(result.rightHandWorldLandmarks || [])
+      ],
+      handednesses: [],
+      handedness: []
+    } as HandLandmarkerResult;
+
+    return { pose, face, hands };
   }
 
   private handleResults(results: {
@@ -222,5 +280,6 @@ export class PoseEngine {
     this.poseLandmarker?.close();
     this.faceLandmarker?.close();
     this.handLandmarker?.close();
+    this.holisticLandmarker?.close();
   }
 }
