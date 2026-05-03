@@ -33,6 +33,7 @@ PROCESSED_PTH_DIR = DATA_DIR / "processed_pth"
 RENDER_DIR = DATA_DIR / "renders"
 PROCESSED_25_CSV_DIR = DATA_DIR / "processed_25_csv"
 PROCESSED_25_NPY_DIR = DATA_DIR / "processed_25_npy"
+PROCESSED_33_NPY_DIR = DATA_DIR / "processed_33_npy"
 PROCESSED_25_META_DIR = DATA_DIR / "processed_25_meta"
 
 for folder in [
@@ -42,6 +43,7 @@ for folder in [
     RENDER_DIR,
     PROCESSED_25_CSV_DIR,
     PROCESSED_25_NPY_DIR,
+    PROCESSED_33_NPY_DIR,
     PROCESSED_25_META_DIR,
 ]:
     folder.mkdir(parents=True, exist_ok=True)
@@ -90,6 +92,7 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
     render_path = RENDER_DIR / f"{capture_id}.mp4"
     processed_25_csv_path = PROCESSED_25_CSV_DIR / f"{capture_id}.csv"
     processed_25_npy_path = PROCESSED_25_NPY_DIR / f"{capture_id}.npy"
+    processed_33_npy_path = PROCESSED_33_NPY_DIR / f"{capture_id}.npy"
     processed_25_meta_path = PROCESSED_25_META_DIR / f"{capture_id}.json"
 
     try:
@@ -136,6 +139,9 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
         keypoints_25_flat = flatten_custom_25_for_csv(keypoints_25)
 
         np.save(processed_25_npy_path, keypoints_25.astype(np.float32))
+        if processed.screening_npy is not None:
+            np.save(processed_33_npy_path, processed.screening_npy)
+
         np.savetxt(
             processed_25_csv_path,
             keypoints_25_flat,
@@ -172,7 +178,8 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
             "capture_meta": payload.meta.model_dump(),
             "files": {
                 "csv_path": str(processed_25_csv_path),
-                "npy_path": str(processed_25_npy_path),
+                "npy_25_path": str(processed_25_npy_path),
+                "npy_33_path": str(processed_33_npy_path),
             },
         }
         processed_25_meta_path.write_text(
@@ -204,6 +211,7 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
         files_to_upload = {
             render_path: f"{capture_id}/skeleton.mp4",
             processed_25_csv_path: f"{capture_id}/data_25.csv",
+            processed_33_npy_path: f"{capture_id}/data_33_screening.npy",
         }
 
         for local_p, remote_n in files_to_upload.items():
@@ -243,6 +251,7 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
         "render_path": str(render_path),
         "processed_25_csv_path": str(processed_25_csv_path),
         "processed_25_npy_path": str(processed_25_npy_path),
+        "processed_33_npy_path": str(processed_33_npy_path),
         "processed_25_meta_path": str(processed_25_meta_path),
         "frames_in": int(keypoints_np.shape[0]),
         "frames_out": int(processed.keypoints.shape[0]),

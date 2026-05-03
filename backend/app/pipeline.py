@@ -4,6 +4,88 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import numpy as np
+import pandas as pd
+from scipy.signal import savgol_filter
+
+
+class SpatialProcessor:
+    def __init__(self, confidence_threshold=0.5, smooth_window=5, poly_order=2):
+        self.confidence_threshold = confidence_threshold
+        self.smooth_window = smooth_window
+        self.poly_order = poly_order
+
+        # Keypoint Indices (MediaPipe)
+        self.L_HIP = 23
+        self.R_HIP = 24
+        self.L_SHOULDER = 11
+        self.R_SHOULDER = 12
+
+    def process_sequence(self, landmarks, vis_mask):
+        """
+        landmarks: np.array of shape [T, 33, 3] (X, Y, Z)
+        vis_mask: np.array of shape [T, 33] (Visibility scores)
+        """
+        # 1. Interpolate missing joints (Linear)
+        landmarks = self._interpolate(landmarks, vis_mask)
+
+        # 2. Root Centering (Pelvis midpoint)
+        root = (landmarks[:, self.L_HIP, :] + landmarks[:, self.R_HIP, :]) / 2.0
+        landmarks = landmarks - root[:, np.newaxis, :]
+
+        # 3. Orientation Alignment (XY Plane Rotation)
+        landmarks = self._align_orientation(landmarks)
+
+        # 4. Scale Normalization (Median Torso Length)
+        landmarks = self._normalize_scale(landmarks)
+
+        # 5. Temporal Smoothing (Savitzky-Golay)
+        landmarks = self._smooth(landmarks)
+
+        return landmarks
+
+    def _interpolate(self, landmarks, vis_mask):
+        landmarks = landmarks.copy()
+        landmarks[vis_mask < self.confidence_threshold] = np.nan
+        T, num_joints, dims = landmarks.shape
+        df = pd.DataFrame(landmarks.reshape(T, -1))
+        df = df.interpolate(method="linear", limit_direction="both").fillna(0)
+        return df.values.reshape(T, num_joints, dims)
+
+    def _align_orientation(self, landmarks):
+        # Calculate average torso vector (Hip to Shoulder)
+        root_2d = (landmarks[:, self.L_HIP, :2] + landmarks[:, self.R_HIP, :2]) / 2.0
+        shld_2d = (
+            landmarks[:, self.L_SHOULDER, :2] + landmarks[:, self.R_SHOULDER, :2]
+        ) / 2.0
+        torso_vec = np.mean(shld_2d - root_2d, axis=0)
+
+        # Rotate to point Up (-90 degrees in image space)
+        d_theta = (-np.pi / 2.0) - np.arctan2(torso_vec[1], torso_vec[0])
+        cos_tr, sin_tr = np.cos(d_theta), np.sin(d_theta)
+        R_xy = np.array([[cos_tr, -sin_tr], [sin_tr, cos_tr]])
+        landmarks[:, :, :2] = np.matmul(landmarks[:, :, :2], R_xy.T)
+        return landmarks
+
+    def _normalize_scale(self, landmarks):
+        root_3d = (landmarks[:, self.L_HIP, :] + landmarks[:, self.R_HIP, :]) / 2.0
+        shld_3d = (
+            landmarks[:, self.L_SHOULDER, :] + landmarks[:, self.R_SHOULDER, :]
+        ) / 2.0
+        torso_len = np.median(np.linalg.norm(shld_3d - root_3d, axis=1))
+        return landmarks / torso_len if torso_len > 1e-5 else landmarks
+
+    def _smooth(self, landmarks):
+        T = landmarks.shape[0]
+        if T > self.smooth_window:
+            window = (
+                self.smooth_window
+                if self.smooth_window % 2 == 1
+                else self.smooth_window + 1
+            )
+            if window > T:
+                window = T if T % 2 == 1 else T - 1
+            landmarks = savgol_filter(landmarks, window, self.poly_order, axis=0)
+        return landmarks
 
 
 @dataclass(frozen=True)
@@ -18,6 +100,19 @@ class PipelineResult:
     keypoints: np.ndarray
     timestamps: np.ndarray
     processing_meta: dict[str, float | int]
+    screening_npy: np.ndarray | None = None
+
+
+def process_for_screening_app(keypoints: np.ndarray) -> np.ndarray:
+    """
+    keypoints: [T, 33, 4] (X, Y, Z, Visibility)
+    Returns: [T, 33, 3] processed for Screening App
+    """
+    coords = keypoints[:, :, :3]
+    visibility = keypoints[:, :, 3]
+    processor = SpatialProcessor()
+    final_npy = processor.process_sequence(coords, visibility)
+    return final_npy.astype(np.float32)
 
 
 def _sorted_unique_timestamps(
@@ -204,6 +299,9 @@ def preprocess_pose_capture(
         normalized_keypoints, config.visibility_threshold
     )
 
+    # Generate 100% compatible screening .npy (33 landmarks, specialized processing)
+    screening_npy = process_for_screening_app(keypoints_np)
+
     processing_meta: dict[str, float | int] = {
         "frames_in": int(keypoints_np.shape[0]),
         "frames_out": int(filled_keypoints.shape[0]),
@@ -216,5 +314,6 @@ def preprocess_pose_capture(
     return PipelineResult(
         keypoints=filled_keypoints,
         timestamps=resampled_timestamps,
-        processing_meta=processing_meta
+        processing_meta=processing_meta,
+        screening_npy=screening_npy
     )
