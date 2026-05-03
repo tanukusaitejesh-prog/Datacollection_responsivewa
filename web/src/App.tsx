@@ -204,7 +204,7 @@ export default function App() {
     if (isRecording && results.pose && results.pose.landmarks && results.pose.landmarks.length > 0) {
       const poseLandmarks = results.pose.landmarks[0];
       const frame = poseLandmarks.map((lm: any) => [
-        lm.x, lm.y, lm.z
+        lm.x, lm.y, lm.z, lm.visibility || 0
       ]);
       
       framesRef.current.push(frame);

@@ -1,3 +1,5 @@
+import { SpatialProcessor } from './spatial-processor';
+
 export interface ValidationResult {
   overall: 'pass' | 'warn' | 'fail';
   checks: {
@@ -107,11 +109,17 @@ export function validatePoseData(frames: number[][][]): ValidationResult {
 
 export function createNpyBuffer(frames: number[][][]): ArrayBuffer {
   const T = frames.length;
-  // Use [T, 33, 3] shape (Pose only)
-  const data = new Float64Array(T * 33 * 3);
+  if (T === 0) return new ArrayBuffer(0);
+
+  // Apply Spatial Processing (Root Centering, Orientation Alignment, Scale Normalization, Smoothing)
+  const processor = new SpatialProcessor();
+  const processed = processor.processSequence(frames);
+
+  // Use [T, 33, 3] shape (Pose only) as Float32
+  const data = new Float32Array(T * 33 * 3);
   for (let t = 0; t < T; t++) {
     for (let i = 0; i < 33; i++) {
-      const lm = frames[t][i] || [0, 0, 0];
+      const lm = processed[t][i] || [0, 0, 0];
       data[t * 99 + i * 3 + 0] = lm[0];
       data[t * 99 + i * 3 + 1] = lm[1];
       data[t * 99 + i * 3 + 2] = lm[2];
@@ -119,26 +127,29 @@ export function createNpyBuffer(frames: number[][][]): ArrayBuffer {
   }
 
   const magic = new Uint8Array([147, 78, 85, 77, 80, 89]); // \x93NUMPY
-  const dictStr = "{'descr': '<f8', 'fortran_order': False, 'shape': (" + T + ", 33, 3), }";
-  
+  // descr: '<f4' for Float32
+  const dictStr =
+    "{'descr': '<f4', 'fortran_order': False, 'shape': (" + T + ", 33, 3), }";
+
   let totalLen = 10 + dictStr.length + 1;
   let paddingLen = 64 - (totalLen % 64);
   if (paddingLen === 64) paddingLen = 0;
   const headerStr = dictStr + ' '.repeat(paddingLen) + '\n';
   const headerLen = headerStr.length;
-  
+
   const buffer = new ArrayBuffer(10 + headerLen + data.byteLength);
   const dv = new DataView(buffer);
-  
+
   for (let i = 0; i < 6; i++) dv.setUint8(i, magic[i]);
   dv.setUint8(6, 1);
   dv.setUint8(7, 0);
   dv.setUint16(8, headerLen, true);
-  for (let i = 0; i < headerLen; i++) dv.setUint8(10 + i, headerStr.charCodeAt(i));
-  
+  for (let i = 0; i < headerLen; i++)
+    dv.setUint8(10 + i, headerStr.charCodeAt(i));
+
   const outBytes = new Uint8Array(buffer);
   const dataBytes = new Uint8Array(data.buffer);
   outBytes.set(dataBytes, 10 + headerLen);
-  
+
   return buffer;
 }
