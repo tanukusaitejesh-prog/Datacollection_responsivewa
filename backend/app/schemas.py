@@ -22,6 +22,7 @@ class UploadPayload(BaseModel):
     meta: CaptureMeta
     face_keypoints: list[list[list[float]]] | None = None
     hand_keypoints: list[list[list[float]]] | None = None
+    face_blendshapes: list[list[dict[str, str | float]]] | None = None
 
     @model_validator(mode="after")
     def validate_shapes(self) -> "UploadPayload":

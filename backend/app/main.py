@@ -20,6 +20,8 @@ from .landmarks25 import (
     convert_33_to_custom_25,
     flatten_custom_25_for_csv,
 )
+import pandas as pd
+from .full_export import flatten_full_capture, generate_full_csv_headers
 from .pipeline import PipelineConfig, preprocess_pose_capture
 from .render import render_skeleton_video
 from .schemas import UploadPayload
@@ -32,6 +34,8 @@ RAW_PTH_DIR = DATA_DIR / "raw_pth"
 PROCESSED_PTH_DIR = DATA_DIR / "processed_pth"
 RENDER_DIR = DATA_DIR / "renders"
 PROCESSED_25_CSV_DIR = DATA_DIR / "processed_25_csv"
+PROCESSED_FULL_CSV_DIR = DATA_DIR / "processed_full_csv"
+PROCESSED_FULL_XLSX_DIR = DATA_DIR / "processed_full_xlsx"
 PROCESSED_25_NPY_DIR = DATA_DIR / "processed_25_npy"
 PROCESSED_33_NPY_DIR = DATA_DIR / "processed_33_npy"
 PROCESSED_25_META_DIR = DATA_DIR / "processed_25_meta"
@@ -42,6 +46,8 @@ for folder in [
     PROCESSED_PTH_DIR,
     RENDER_DIR,
     PROCESSED_25_CSV_DIR,
+    PROCESSED_FULL_CSV_DIR,
+    PROCESSED_FULL_XLSX_DIR,
     PROCESSED_25_NPY_DIR,
     PROCESSED_33_NPY_DIR,
     PROCESSED_25_META_DIR,
@@ -91,6 +97,8 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
     processed_pth_path = PROCESSED_PTH_DIR / f"{capture_id}.pth"
     render_path = RENDER_DIR / f"{capture_id}.mp4"
     processed_25_csv_path = PROCESSED_25_CSV_DIR / f"{capture_id}.csv"
+    processed_full_csv_path = PROCESSED_FULL_CSV_DIR / f"{capture_id}.csv"
+    processed_full_xlsx_path = PROCESSED_FULL_XLSX_DIR / f"{capture_id}.xlsx"
     processed_25_npy_path = PROCESSED_25_NPY_DIR / f"{capture_id}.npy"
     processed_33_npy_path = PROCESSED_33_NPY_DIR / f"{capture_id}.npy"
     processed_25_meta_path = PROCESSED_25_META_DIR / f"{capture_id}.json"
@@ -150,6 +158,22 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
             comments="",
         )
 
+        # Generate FULL CSV (1600+ columns)
+        full_data = flatten_full_capture(payload, keypoints_25, timestamps_np)
+        full_headers = generate_full_csv_headers()
+        np.savetxt(
+            processed_full_csv_path,
+            full_data,
+            delimiter=",",
+            header=",".join(full_headers),
+            fmt="%s",
+            comments="",
+        )
+
+        # Generate FULL XLSX
+        df = pd.DataFrame(full_data, columns=full_headers)
+        df.to_excel(processed_full_xlsx_path, index=False)
+
         timestamps_start = (
             float(timestamps_np[0]) if timestamps_np.shape[0] > 0 else None
         )
@@ -177,7 +201,9 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
             },
             "capture_meta": payload.meta.model_dump(),
             "files": {
-                "csv_path": str(processed_25_csv_path),
+                "csv_25_path": str(processed_25_csv_path),
+                "csv_full_path": str(processed_full_csv_path),
+                "xlsx_full_path": str(processed_full_xlsx_path),
                 "npy_25_path": str(processed_25_npy_path),
                 "npy_33_path": str(processed_33_npy_path),
             },
@@ -211,6 +237,8 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
         files_to_upload = {
             render_path: f"{capture_id}/skeleton.mp4",
             processed_25_csv_path: f"{capture_id}/data_25.csv",
+            processed_full_csv_path: f"{capture_id}/data_full.csv",
+            processed_full_xlsx_path: f"{capture_id}/data_full.xlsx",
             processed_33_npy_path: f"{capture_id}/data_33_screening.npy",
         }
 
@@ -250,6 +278,8 @@ async def upload_capture(payload: UploadPayload) -> dict[str, object]:
         "processed_pth_path": str(processed_pth_path),
         "render_path": str(render_path),
         "processed_25_csv_path": str(processed_25_csv_path),
+        "processed_full_csv_path": str(processed_full_csv_path),
+        "processed_full_xlsx_path": str(processed_full_xlsx_path),
         "processed_25_npy_path": str(processed_25_npy_path),
         "processed_33_npy_path": str(processed_33_npy_path),
         "processed_25_meta_path": str(processed_25_meta_path),
