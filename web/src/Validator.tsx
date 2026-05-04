@@ -190,12 +190,32 @@ export const Validator: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     
     const pts: {x: number, y: number}[] = [];
     for(let j=0; j<33; j++){
-      const x = data[j*3], y = data[j*3+1];
+      let x = data[j*3], y = data[j*3+1];
+      
+      // Foot landmark spread (indices 29, 30, 31, 32)
+      if (j >= 29 && j <= 32) {
+        const ankleIdx = j % 2 === 1 ? 27 : 28;
+        const ax = data[ankleIdx*3], ay = data[ankleIdx*3+1];
+        const dx = x - ax, dy = y - ay;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist < 0.02) { // Normalized units, 0.02 is roughly 5-10px
+          const scale = 0.02 / (dist || 1);
+          x = ax + dx * scale;
+          y = ay + dy * scale;
+        }
+      }
       pts.push({x, y});
     }
 
     let mnx=Infinity, mxx=-Infinity, mny=Infinity, mxy=-Infinity;
     pts.forEach(p=>{ if(p.x<mnx) mnx=p.x; if(p.x>mxx) mxx=p.x; if(p.y<mny) mny=p.y; if(p.y>mxy) mxy=p.y; });
+    
+    // Include synthetic neck in bounds calculation
+    const neckX = (pts[11].x + pts[12].x) / 2;
+    const neckY = (pts[11].y + pts[12].y) / 2;
+    if (neckX < mnx) mnx = neckX; if (neckX > mxx) mxx = neckX;
+    if (neckY < mny) mny = neckY; if (neckY > mxy) mxy = neckY;
+
     const pad = 40; 
     const scaleX = (W - pad*2) / (mxx-mnx || 1); 
     const scaleY = (H - pad*2) / (mxy-mny || 1);
@@ -206,7 +226,14 @@ export const Validator: React.FC<{ onBack: () => void }> = ({ onBack }) => {
     const tx = (p: {x: number, y: number}) => cx + (p.x-ox)*scale;
     const ty = (p: {x: number, y: number}) => cy + (p.y-oy)*scale;
 
-    const conns = [[0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10],[11,12],[11,13],[13,15],[12,14],[14,16],[15,17],[15,19],[15,21],[16,18],[16,20],[16,22],[17,19],[18,20],[11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28],[27,29],[28,30],[29,31],[30,32],[27,31],[28,32]];
+    // Standard connections + head-to-body + neck
+    const conns = [
+      [0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],[9,10], // Face
+      [0,11],[0,12], // Head to Body connections
+      [11,12],[11,13],[13,15],[12,14],[14,16],[15,17],[15,19],[15,21],[16,18],[16,20],[16,22],[17,19],[18,20], // Torso & Arms
+      [11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28],[27,29],[28,30],[29,31],[30,32],[27,31],[28,32] // Legs & Feet
+    ];
+
     ctx.strokeStyle = 'rgba(14, 106, 168, 0.5)';
     ctx.lineWidth = 2;
     conns.forEach(([a,b]) => {
@@ -215,6 +242,12 @@ export const Validator: React.FC<{ onBack: () => void }> = ({ onBack }) => {
       ctx.lineTo(tx(pts[b]), ty(pts[b]));
       ctx.stroke();
     });
+
+    // Draw neck connection
+    ctx.beginPath();
+    ctx.moveTo(tx(pts[0]), ty(pts[0]));
+    ctx.lineTo(tx({x: neckX, y: neckY}), ty({x: neckX, y: neckY}));
+    ctx.stroke();
 
     pts.forEach((p, i) => {
       ctx.beginPath();

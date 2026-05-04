@@ -163,6 +163,9 @@ body {
 }
 
 .camera-stream {
+  position: absolute;
+  top: 0;
+  left: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
@@ -180,6 +183,7 @@ body {
   left: 0;
   width: 100%;
   height: 100%;
+  object-fit: cover; /* Match video clipping */
   pointer-events: none;
   transform: scaleX(-1); /* Mirror to match camera-stream */
 }
