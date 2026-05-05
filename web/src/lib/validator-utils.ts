@@ -1,4 +1,3 @@
-import { OneEuroFilter } from './filters';
 
 export interface ValidationResult {
   overall: 'pass' | 'warn' | 'fail';
@@ -424,30 +423,48 @@ export function normalizePoseSequence(frames: number[][][]): number[][][] {
     }
   }
 
-  // 4. Linear Interpolation for missing frames (NaNs)
+  // 4. Confidence-based "Lock" to prevent hallucinations
+  // If visibility is extremely low, we clamp to 0 to indicate "missing"
+  centered.forEach(frame => {
+    frame.forEach(lm => {
+      const visibility = lm[3] ?? 0;
+      if (visibility < 0.1) {
+        lm[0] = 0;
+        lm[1] = 0;
+        lm[2] = 0;
+      }
+    });
+  });
+
+  // 5. Linear Interpolation for missing frames (NaNs)
   const T_final = centered.length;
   for (let i = 0; i < POSE_LANDMARK_COUNT; i++) {
     for (let t = 0; t < T_final; t++) {
       if (!isFiniteNumber(centered[t][i][0])) {
         let prevIdx = -1;
         for (let pt = t - 1; pt >= 0; pt--) {
-          if (isFiniteNumber(centered[pt][i][0])) {
+          if (isFiniteNumber(centered[pt][i][0]) && (centered[pt][i][0] !== 0 || centered[pt][i][1] !== 0)) {
             prevIdx = pt;
             break;
           }
         }
         let nextIdx = -1;
         for (let nt = t + 1; nt < T_final; nt++) {
-          if (isFiniteNumber(centered[nt][i][0])) {
+          if (isFiniteNumber(centered[nt][i][0]) && (centered[nt][i][0] !== 0 || centered[nt][i][1] !== 0)) {
             nextIdx = nt;
             break;
           }
         }
 
         if (prevIdx !== -1 && nextIdx !== -1) {
-          const fraction = (t - prevIdx) / (nextIdx - prevIdx);
-          for (let dim = 0; dim < 3; dim++) {
-            centered[t][i][dim] = centered[prevIdx][i][dim] + (centered[nextIdx][i][dim] - centered[prevIdx][i][dim]) * fraction;
+          // Only interpolate small gaps (< 10 frames) to avoid "sliding hallucination"
+          if (nextIdx - prevIdx < 10) {
+            const fraction = (t - prevIdx) / (nextIdx - prevIdx);
+            for (let dim = 0; dim < 3; dim++) {
+              centered[t][i][dim] = centered[prevIdx][i][dim] + (centered[nextIdx][i][dim] - centered[prevIdx][i][dim]) * fraction;
+            }
+          } else {
+            for (let dim = 0; dim < 3; dim++) centered[t][i][dim] = 0.0;
           }
         } else if (prevIdx !== -1) {
           for (let dim = 0; dim < 3; dim++) centered[t][i][dim] = centered[prevIdx][i][dim];
@@ -458,30 +475,6 @@ export function normalizePoseSequence(frames: number[][][]): number[][][] {
         }
       }
     }
-  }
-
-  // 5. One Euro Filter (Adaptive Anti-Jitter)
-  // This is a "smart" filter that is stable when the subject is still,
-  // but becomes sensitive to fast movements (like autistic stimming/shaking)
-  // to ensure diagnostic patterns are not lost.
-  const T = centered.length;
-  if (T > 1) {
-    const filters = Array.from({ length: POSE_LANDMARK_COUNT * 3 }, (_, index) => {
-      const jointIdx = Math.floor(index / 3);
-      // Wrists (15,16) and Hand Tips (17-22) need MUCH higher sensitivity for flapping
-      const isHandJoint = jointIdx >= 15 && jointIdx <= 22;
-      return new OneEuroFilter(1.0, isHandJoint ? 0.8 : 0.1);
-    });
-    const smoothed = centered.map(frame => frame.map(lm => [...lm]));
-    
-    for (let t = 0; t < T; t++) {
-      for (let i = 0; i < POSE_LANDMARK_COUNT; i++) {
-        for (let dim = 0; dim < 3; dim++) {
-          smoothed[t][i][dim] = filters[i * 3 + dim].filter(centered[t][i][dim], 30);
-        }
-      }
-    }
-    return smoothed;
   }
 
   return centered;

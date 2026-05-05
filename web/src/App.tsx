@@ -300,7 +300,11 @@ async function pushToMongoDirect(payload: any, captureId: string) {
     return true;
   } catch (err: any) {
     console.error('Web MongoDB direct push failed:', err);
-    return { success: false, error: err.message };
+    let message = err.message;
+    if (message.includes('Unexpected token') || message.includes('DOCTYPE')) {
+      message = 'Netlify function not found. Use "netlify dev" to run locally.';
+    }
+    return { success: false, error: message };
   }
 }
 
@@ -348,6 +352,8 @@ export default function App() {
   const [gender, setGender] = useState<Gender>('prefer_not_to_say');
   const [cameraFacing, setCameraFacing] = useState<CameraFacing>('user');
   const [captureMode, setCaptureMode] = useState<CaptureMode>('holistic');
+  const [clinicianNotes, setClinicianNotes] = useState('');
+  const [showNotes, setShowNotes] = useState(false);
   const [showPermissionGuide, setShowPermissionGuide] = useState(false);
   const cameraActive = step === 'testing' || step === 'recording';
 
@@ -479,7 +485,8 @@ export default function App() {
         return;
       }
 
-      const poseLandmarks = results.pose.landmarks[0];
+      // Use worldLandmarks (meters) instead of landmarks (normalized) for training consistency
+      const poseLandmarks = results.pose.worldLandmarks?.[0] || results.pose.landmarks[0];
       const frame = poseLandmarks.map((lm: any) => [
         coordOrNaN(lm.x), coordOrNaN(lm.y), coordOrNaN(lm.z), coordOrNaN(lm.visibility || 0)
       ]);
@@ -588,7 +595,8 @@ export default function App() {
         subject_id: subjectId,
         action_type: actionType,
         age: isNaN(safeAge) ? null : safeAge,
-        gender: gender
+        gender: gender,
+        clinician_notes: clinicianNotes
       }
     };
 
@@ -648,6 +656,16 @@ export default function App() {
     setIsUploading(true);
     try {
       const res = await fetch('/.netlify/functions/pushToMongo');
+      if (!res.ok) {
+        const text = await res.text();
+        if (text.trim().startsWith('<!DOCTYPE html>')) {
+          alert('MongoDB Connection Failed!\nReason: Netlify functions are not available in the current environment. Please run with "netlify dev".');
+        } else {
+          alert(`MongoDB Connection Failed!\nStatus: ${res.status}\nReason: ${text.slice(0, 100)}`);
+        }
+        setIsUploading(false);
+        return;
+      }
       const data = await res.json();
       if (res.ok) {
         alert('MongoDB Connection Successful!');
@@ -655,7 +673,11 @@ export default function App() {
         alert(`MongoDB Connection Failed!\nReason: ${data.error || data.message}`);
       }
     } catch (err: any) {
-      alert(`Network Error: ${err.message}`);
+      let message = err.message;
+      if (message.includes('Unexpected token') || message.includes('DOCTYPE')) {
+        message = 'Netlify function not found. Use "netlify dev" to run locally.';
+      }
+      alert(`Network Error: ${message}`);
     }
     setIsUploading(false);
   };
@@ -705,15 +727,58 @@ export default function App() {
                 </div>
               </div>
 
+              <div style={{marginTop: 12, marginBottom: 12}}>
+                <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Category</label>
+                <div className="chip-grid">
+                  <div 
+                    className={`chip ${actionType === 'asd' ? 'active' : ''}`}
+                    onClick={() => setActionType('asd')}
+                  >
+                    ASD
+                  </div>
+                  <div 
+                    className={`chip ${actionType === 'td' ? 'active' : ''}`}
+                    onClick={() => setActionType('td')}
+                  >
+                    TD
+                  </div>
+                  <div 
+                    className={`chip ${['asd', 'td'].includes(actionType.toLowerCase()) ? '' : actionType ? 'active' : ''}`}
+                    onClick={() => setActionType('')}
+                  >
+                    Other
+                  </div>
+                </div>
+              </div>
+
               <div className="form-grid form-grid-spaced">
                 <div>
                   <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Age</label>
                   <input type="number" className="input-field" value={age} onChange={e => setAge(e.target.value)} placeholder="Age" />
                 </div>
                 <div>
-                  <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Action Type</label>
-                  <input className="input-field" value={actionType} onChange={e => setActionType(e.target.value)} placeholder="e.g. sit, stand, reach, turn" />
+                  <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Action Type / Label</label>
+                  <input className="input-field" value={actionType} onChange={e => setActionType(e.target.value)} placeholder="e.g. asd, td, or custom action" />
                 </div>
+              </div>
+
+              <div style={{marginTop: 12}}>
+                <button 
+                  className="btn btn-secondary" 
+                  style={{fontSize: 12, padding: '8px 12px', width: 'auto', marginBottom: showNotes ? 8 : 0}}
+                  onClick={() => setShowNotes(!showNotes)}
+                >
+                  {showNotes ? 'Hide Notes' : 'Add Clinician Notes'}
+                </button>
+                {showNotes && (
+                  <textarea 
+                    className="input-field" 
+                    style={{minHeight: 80, resize: 'vertical'}}
+                    value={clinicianNotes}
+                    onChange={e => setClinicianNotes(e.target.value)}
+                    placeholder="Enter clinical observations or session notes..."
+                  />
+                )}
               </div>
 
               <div style={{marginTop: 12}}>
@@ -921,6 +986,17 @@ export default function App() {
                   <label style={{fontSize: 10, fontWeight: 700}}>Action</label>
                   <input className="input-field" value={actionType} onChange={e => setActionType(e.target.value)} />
                 </div>
+              </div>
+
+              <div style={{marginTop: 10}}>
+                <label style={{fontSize: 10, fontWeight: 700}}>Clinician Notes</label>
+                <textarea 
+                  className="input-field" 
+                  style={{minHeight: 60, resize: 'vertical', fontSize: 13}}
+                  value={clinicianNotes}
+                  onChange={e => setClinicianNotes(e.target.value)}
+                  placeholder="Final session notes..."
+                />
               </div>
             </div>
 

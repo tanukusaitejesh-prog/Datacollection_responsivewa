@@ -14,6 +14,7 @@ class CaptureMeta(BaseModel):
     action_type: str | None = None
     age: int | None = Field(default=None, ge=1, le=120)
     gender: Literal["male", "female", "other", "prefer_not_to_say"] | None = None
+    clinician_notes: str | None = None
 
 
 class UploadPayload(BaseModel):
