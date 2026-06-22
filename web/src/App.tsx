@@ -15,7 +15,7 @@ import {
 import { PoseLandmarkerResult } from '@mediapipe/tasks-vision';
 import { supabase } from './lib/supabase';
 import { analyzePoseFrame, evaluateCaptureReadiness, type PoseFrameQuality } from './lib/quality';
-import { validatePoseData, ValidationResult, createNpyBuffer, normalizePoseSequence } from './lib/validator-utils';
+import { validatePoseData, ValidationResult, createNpyBuffer, normalizePoseSequence, resampleSequence30FPS, resampleBlendshapes30FPS } from './lib/validator-utils';
 import { Validator } from './Validator';
 
 const GENDER_OPTIONS = [
@@ -24,6 +24,14 @@ const GENDER_OPTIONS = [
   { value: 'other', label: 'Other' },
   { value: 'prefer_not_to_say', label: 'N/A' },
 ] as const;
+
+const CENTER_OPTIONS = [
+  { value: 'barkatpura', label: 'Barkatpura' },
+  { value: 'neredmet', label: 'Neredmet' },
+  { value: 'other', label: 'Other' },
+] as const;
+
+type CenterName = (typeof CENTER_OPTIONS)[number]['value'];
 
 /*
 const LANDMARK_NAMES = [
@@ -38,7 +46,8 @@ const LANDMARK_NAMES = [
 type Gender = (typeof GENDER_OPTIONS)[number]['value'];
 type Step = 'home' | 'testing' | 'recording' | 'confirm' | 'validator';
 type CameraFacing = 'user' | 'environment';
-type CaptureMode = 'pose_only' | 'holistic';
+type CaptureMode = 'pose_only' | 'holistic' | 'half_body';
+
 type RecordedPoseQuality = Pick<PoseFrameQuality, 'score' | 'averageVisibility' | 'reliableLandmarks' | 'inFrameLandmarks' | 'bodyBoxArea'> & {
   timestampMs: number;
 };
@@ -113,7 +122,7 @@ function summarizePoseQuality(samples: RecordedPoseQuality[], skippedFrames: num
 function generateClinicalCsvString(frames: number[][][], timestamps: number[]): string {
   if (frames.length === 0) return '';
 
-  const jointNames = [
+  const KINECT_JOINT_ORDER = [
     'Midspain', 'AnkleLeft', 'AnkleRight', 'ElbowLeft', 'ElbowRight',
     'FootLeft', 'FootRight', 'HandLeft', 'HandRight', 'HandTipLeft',
     'HandTipRight', 'Head', 'HipLeft', 'HipRight', 'KneeLeft',
@@ -121,122 +130,178 @@ function generateClinicalCsvString(frames: number[][][], timestamps: number[]): 
     'SpineShoulder', 'ThumbLeft', 'ThumbRight', 'WristLeft', 'WristRight'
   ];
 
-  const featureNames = [
-    'HESHL', 'HESHR', 'SPELL', 'SPELR', 'SHWRL', 'SHWRR', 'ELHAL', 'ELHAR',
-    'THHAL', 'THHAR', 'THHTIL', 'THHTIR', 'SPKNL', 'SPKNR', 'HIANL', 'HIANR',
-    'KNFOL', 'KNFOR', 'DFRToFL', 'MinDBFAC', 'MaxDBFE', 'MinDBFE', 'Threshold'
-  ];
-
-  const headers = ['H:M:S:MS'];
-  jointNames.forEach(name => headers.push(`${name}_X`, `${name}_Y`, `${name}_Z`));
-  featureNames.forEach(name => headers.push(name));
-
-  const csvRows = [headers.join('\t')];
-
-  const getAngle = (p1: number[], p2: number[], p3: number[]) => {
-    if (!p1 || !p2 || !p3) return 0;
-    const v1 = [p1[0] - p2[0], p1[1] - p2[1], p1[2] - p2[2]];
-    const v2 = [p3[0] - p2[0], p3[1] - p2[1], p3[2] - p2[2]];
-    const dot = v1[0] * v2[0] + v1[1] * v2[1] + v1[2] * v2[2];
-    const mag1 = Math.sqrt(v1[0]**2 + v1[1]**2 + v1[2]**2);
-    const mag2 = Math.sqrt(v2[0]**2 + v2[1]**2 + v2[2]**2);
-    if (mag1 * mag2 < 1e-6) return 0;
-    return Math.acos(Math.max(-1, Math.min(1, dot / (mag1 * mag2)))) * (180 / Math.PI);
+  const formatTimestamp = (ms: number): string => {
+    const totalSeconds = Math.floor(ms / 1000);
+    const milliseconds = Math.floor(ms % 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}:${milliseconds.toString().padStart(3, '0')})`;
   };
 
-  const getDist = (p1: number[], p2: number[]) => {
-    if (!p1 || !p2) return 0;
-    return Math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2 + (p1[2]-p2[2])**2);
-  };
+  const headers = ['H:M:S:MS)'];
+  KINECT_JOINT_ORDER.forEach(joint => {
+    headers.push(`${joint}-x`, `${joint}-y`, `${joint}-z`);
+  });
 
-  const startTime = Date.now(); // Base time for H:M:S:MS
+  const csvRows = [headers.join(',')];
+  const grid: Record<string, number[]>[] = [];
 
-  frames.forEach((frame, t) => {
+  frames.forEach((frame) => {
+    const getXYZ = (idx: number) => {
+      const p = frame[idx];
+      if (!p || (p[0] === 0 && p[1] === 0 && p[2] === 0) || !Number.isFinite(p[0])) {
+        return [NaN, NaN, NaN];
+      }
+      return [p[0] * -1.0, p[1] * -1.0, p[2]];
+    };
+
+    const getMid = (idx1: number, idx2: number) => {
+      const p1 = frame[idx1];
+      const p2 = frame[idx2];
+      if (!p1 || !p2 || 
+          (p1[0] === 0 && p1[1] === 0 && p1[2] === 0) || 
+          (p2[0] === 0 && p2[1] === 0 && p2[2] === 0) ||
+          !Number.isFinite(p1[0]) || !Number.isFinite(p2[0])) {
+        return [NaN, NaN, NaN];
+      }
+      return [
+        ((p1[0] + p2[0]) / 2.0) * -1.0,
+        ((p1[1] + p2[1]) / 2.0) * -1.0,
+        (p1[2] + p2[2]) / 2.0
+      ];
+    };
+
+    const spineShoulder = getMid(11, 12);
+    const spineBase = getMid(23, 24);
+    let midspain = [NaN, NaN, NaN];
+    if (Number.isFinite(spineShoulder[0]) && Number.isFinite(spineBase[0])) {
+      midspain = [
+        (spineShoulder[0] + spineBase[0]) / 2.0,
+        (spineShoulder[1] + spineBase[1]) / 2.0,
+        (spineShoulder[2] + spineBase[2]) / 2.0
+      ];
+    }
+
+    grid.push({
+      'Midspain': midspain,
+      'AnkleLeft': getXYZ(27),
+      'AnkleRight': getXYZ(28),
+      'ElbowLeft': getXYZ(13),
+      'ElbowRight': getXYZ(14),
+      'FootLeft': getXYZ(31),
+      'FootRight': getXYZ(32),
+      'HandLeft': getXYZ(15),
+      'HandRight': getXYZ(16),
+      'HandTipLeft': getXYZ(19),
+      'HandTipRight': getXYZ(20),
+      'Head': getXYZ(0),
+      'HipLeft': getXYZ(23),
+      'HipRight': getXYZ(24),
+      'KneeLeft': getXYZ(25),
+      'KneeRight': getXYZ(26),
+      'Neck': getMid(11, 12),
+      'ShoulderLeft': getXYZ(11),
+      'ShoulderRight': getXYZ(12),
+      'SpineBase': spineBase,
+      'SpineShoulder': spineShoulder,
+      'ThumbLeft': getXYZ(21),
+      'ThumbRight': getXYZ(22),
+      'WristLeft': getXYZ(15),
+      'WristRight': getXYZ(16)
+    });
+  });
+
+  const T = frames.length;
+
+  // Linear interpolation matching pandas df.interpolate(method='linear', limit_direction='both')
+  // plus ffill() and bfill() and fallback to 0.0
+  KINECT_JOINT_ORDER.forEach(joint => {
+    for (let axis = 0; axis < 3; axis++) {
+      const validIndices: number[] = [];
+      for (let t = 0; t < T; t++) {
+        if (Number.isFinite(grid[t][joint][axis])) {
+          validIndices.push(t);
+        }
+      }
+
+      if (validIndices.length === 0) {
+        for (let t = 0; t < T; t++) {
+          grid[t][joint][axis] = 0.0;
+        }
+      } else {
+        for (let t = 0; t < T; t++) {
+          if (!Number.isFinite(grid[t][joint][axis])) {
+            if (t < validIndices[0]) {
+              grid[t][joint][axis] = grid[validIndices[0]][joint][axis];
+            } else if (t > validIndices[validIndices.length - 1]) {
+              grid[t][joint][axis] = grid[validIndices[validIndices.length - 1]][joint][axis];
+            } else {
+              let prevIdx = validIndices[0];
+              let nextIdx = validIndices[validIndices.length - 1];
+              for (let i = 0; i < validIndices.length; i++) {
+                if (validIndices[i] < t) prevIdx = validIndices[i];
+                if (validIndices[i] > t) {
+                  nextIdx = validIndices[i];
+                  break;
+                }
+              }
+              const fraction = (t - prevIdx) / (nextIdx - prevIdx);
+              const valPrev = grid[prevIdx][joint][axis];
+              const valNext = grid[nextIdx][joint][axis];
+              grid[t][joint][axis] = valPrev + (valNext - valPrev) * fraction;
+            }
+          }
+        }
+      }
+    }
+  });
+
+  // Construct CSV String
+  frames.forEach((_, t) => {
     const ts = timestamps[t] || 0;
-    const d = new Date(startTime + ts);
-    const timeStr = `${d.getHours().toString().padStart(2, '0')}:${d.getMinutes().toString().padStart(2, '0')}:${d.getSeconds().toString().padStart(2, '0')}:${d.getMilliseconds().toString().padStart(3, '0')}`;
+    const timeStr = formatTimestamp(ts);
+    const row: string[] = [timeStr];
 
-    // Map 33 MP landmarks to 25 Kinect joints
-    const joints: Record<string, number[]> = {};
-    const MP = (i: number) => frame[i] || [0,0,0];
-
-    const midHips = [(MP(23)[0] + MP(24)[0])/2, (MP(23)[1] + MP(24)[1])/2, (MP(23)[2] + MP(24)[2])/2];
-    const midShoulders = [(MP(11)[0] + MP(12)[0])/2, (MP(11)[1] + MP(12)[1])/2, (MP(11)[2] + MP(12)[2])/2];
-
-    joints['Midspain'] = [(midHips[0] + midShoulders[0])/2, (midHips[1] + midShoulders[1])/2, (midHips[2] + midShoulders[2])/2];
-    joints['AnkleLeft'] = MP(27);
-    joints['AnkleRight'] = MP(28);
-    joints['ElbowLeft'] = MP(13);
-    joints['ElbowRight'] = MP(14);
-    joints['FootLeft'] = MP(31);
-    joints['FootRight'] = MP(32);
-    joints['HandLeft'] = MP(15);
-    joints['HandRight'] = MP(16);
-    joints['HandTipLeft'] = MP(19);
-    joints['HandTipRight'] = MP(20);
-    joints['Head'] = MP(0);
-    joints['HipLeft'] = MP(23);
-    joints['HipRight'] = MP(24);
-    joints['KneeLeft'] = MP(25);
-    joints['KneeRight'] = MP(26);
-    joints['Neck'] = [(midShoulders[0]*0.8 + MP(0)[0]*0.2), (midShoulders[1]*0.8 + MP(0)[1]*0.2), (midShoulders[2]*0.8 + MP(0)[2]*0.2)];
-    joints['ShoulderLeft'] = MP(11);
-    joints['ShoulderRight'] = MP(12);
-    joints['SpineBase'] = midHips;
-    joints['SpineShoulder'] = midShoulders;
-    joints['ThumbLeft'] = MP(21);
-    joints['ThumbRight'] = MP(22);
-    joints['WristLeft'] = MP(15);
-    joints['WristRight'] = MP(16);
-
-    const row: any[] = [timeStr];
-    jointNames.forEach(name => {
-      const p = joints[name];
-      row.push(p[0].toFixed(6), p[1].toFixed(6), p[2].toFixed(6));
+    KINECT_JOINT_ORDER.forEach(joint => {
+      const coords = grid[t][joint];
+      row.push(coords[0].toFixed(6), coords[1].toFixed(6), coords[2].toFixed(6));
     });
 
-    // Derived Features
-    const f: Record<string, number> = {};
-    f['HESHL'] = getAngle(joints['Head'], joints['Neck'], joints['ShoulderLeft']);
-    f['HESHR'] = getAngle(joints['Head'], joints['Neck'], joints['ShoulderRight']);
-    f['SPELL'] = getAngle(joints['SpineShoulder'], joints['ShoulderLeft'], joints['ElbowLeft']);
-    f['SPELR'] = getAngle(joints['SpineShoulder'], joints['ShoulderRight'], joints['ElbowRight']);
-    f['SHWRL'] = getAngle(joints['ShoulderLeft'], joints['ElbowLeft'], joints['WristLeft']);
-    f['SHWRR'] = getAngle(joints['ShoulderRight'], joints['ElbowRight'], joints['WristRight']);
-    f['ELHAL'] = getAngle(joints['ElbowLeft'], joints['ShoulderLeft'], joints['HipLeft']);
-    f['ELHAR'] = getAngle(joints['ElbowRight'], joints['ShoulderRight'], joints['HipRight']);
-    f['THHAL'] = getAngle(joints['ThumbLeft'], joints['WristLeft'], joints['HandLeft']);
-    f['THHAR'] = getAngle(joints['ThumbRight'], joints['WristRight'], joints['HandRight']);
-    f['THHTIL'] = getAngle(joints['ThumbLeft'], joints['HandLeft'], joints['HandTipLeft']);
-    f['THHTIR'] = getAngle(joints['ThumbRight'], joints['HandRight'], joints['HandTipRight']);
-    f['SPKNL'] = getAngle(joints['SpineBase'], joints['HipLeft'], joints['KneeLeft']);
-    f['SPKNR'] = getAngle(joints['SpineBase'], joints['HipRight'], joints['KneeRight']);
-    f['HIANL'] = getAngle(joints['HipLeft'], joints['KneeLeft'], joints['AnkleLeft']);
-    f['HIANR'] = getAngle(joints['HipRight'], joints['KneeRight'], joints['AnkleRight']);
-    f['KNFOL'] = getAngle(joints['KneeLeft'], joints['AnkleLeft'], joints['FootLeft']);
-    f['KNFOR'] = getAngle(joints['KneeRight'], joints['AnkleRight'], joints['FootRight']);
-    f['DFRToFL'] = getDist(joints['SpineBase'], joints['FootLeft']);
-    f['MinDBFAC'] = getDist(joints['AnkleLeft'], joints['AnkleRight']);
-    f['MaxDBFE'] = f['MinDBFAC']; // Placeholder for max/min logic
-    f['MinDBFE'] = f['MinDBFAC'];
-    f['Threshold'] = 0.3;
-
-    featureNames.forEach(name => row.push(f[name].toFixed(6)));
-    csvRows.push(row.join('\t'));
+    csvRows.push(row.join(','));
   });
 
   return csvRows.join('\n');
 }
 
-async function uploadToSupabaseDirect(payload: any, captureId: string, csvString: string) {
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+async function uploadToSupabaseDirect(
+  payload: any,
+  captureId: string,
+  csvString: string,
+  npyPoseOnlyBuffer: ArrayBuffer,
+  npyPoseHandsBuffer: ArrayBuffer
+) {
   try {
-    const jsonFileName = `${captureId}/raw_capture.json`;
-    const npyFileName = `${captureId}/keypoints.npy`;
-    const csvFileName = `${captureId}/keypoints.csv`;
+    const slugify = (t: string) => (t || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
+    const slugSubject = slugify(payload.meta?.subject_name) || 'subject';
+    
+    const jsonFileName = `${captureId}/${slugSubject}_raw_capture.json`;
+    const npyFileName = `${captureId}/${slugSubject}_keypoints.npy`;
+    const npyPoseHandsFileName = `${captureId}/${slugSubject}_keypoints_pose_hands.npy`;
+    const csvFileName = `${captureId}/${slugSubject}_keypoints.csv`;
     
     const jsonBlob = new Blob([stringifyWithNaN(payload)], { type: 'application/json' });
-    const npyBuffer = createNpyBuffer(payload.keypoints);
-    const npyBlob = new Blob([npyBuffer], { type: 'application/octet-stream' });
+    const npyBlob = new Blob([npyPoseOnlyBuffer], { type: 'application/octet-stream' });
+    const npyPoseHandsBlob = new Blob([npyPoseHandsBuffer], { type: 'application/octet-stream' });
     const csvBlob = new Blob([csvString], { type: 'text/csv' });
 
     // 1. Upload JSON
@@ -246,27 +311,35 @@ async function uploadToSupabaseDirect(payload: any, captureId: string, csvString
 
     if (jsonError) throw jsonError;
 
-    // 2. Upload NPY
+    // 2. Upload Pose-only NPY
     const { error: npyError } = await supabase.storage
       .from('pose-captures')
       .upload(npyFileName, npyBlob, { upsert: true });
 
     if (npyError) throw npyError;
 
-    // 3. Upload CSV
+    // 3. Upload Pose+Hands NPY
+    const { error: npyPoseHandsError } = await supabase.storage
+      .from('pose-captures')
+      .upload(npyPoseHandsFileName, npyPoseHandsBlob, { upsert: true });
+
+    if (npyPoseHandsError) throw npyPoseHandsError;
+
+    // 4. Upload CSV
     const { error: csvError } = await supabase.storage
       .from('pose-captures')
       .upload(csvFileName, csvBlob, { upsert: true });
 
     if (csvError) throw csvError;
 
-    // 4. Insert DB record
+    // 5. Insert DB record
     const { error: dbError } = await supabase.from('captures').insert({
       capture_id: captureId,
       meta: payload.meta,
       storage_paths: {
         raw_json: jsonFileName,
         keypoints_npy: npyFileName,
+        keypoints_pose_hands_npy: npyPoseHandsFileName,
         keypoints_csv: csvFileName
       }
     });
@@ -279,34 +352,59 @@ async function uploadToSupabaseDirect(payload: any, captureId: string, csvString
   }
 }
 
-async function pushToMongoDirect(payload: any, captureId: string) {
-  try {
-    const response = await fetch('/.netlify/functions/pushToMongo', {
+async function pushToMongoDirect(
+  payload: any,
+  captureId: string,
+  npyPoseOnlyBuffer: ArrayBuffer,
+  npyPoseHandsBuffer: ArrayBuffer
+) {
+  const FUNCTION_URL = '/.netlify/functions/pushToMongo';
+
+  async function sendChunk(body: any, label: string) {
+    const response = await fetch(FUNCTION_URL, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: stringifyWithNaN({
-        captureId,
-        ...payload
-      }),
+      headers: { 'Content-Type': 'application/json' },
+      body: stringifyWithNaN(body),
     });
-
     if (!response.ok) {
-      const errorData = await response.json();
-      throw new Error(errorData.error || errorData.message || 'Failed to push to MongoDB');
+      let errMsg = `${label} failed (HTTP ${response.status})`;
+      try {
+        const errData = await response.json();
+        errMsg = errData.error || errData.message || errMsg;
+      } catch {
+        const text = await response.text();
+        if (text.includes('<!DOCTYPE') || text.includes('<html')) {
+          errMsg = `${label}: payload too large or function error (${response.status})`;
+        }
+      }
+      throw new Error(errMsg);
     }
+    return true;
+  }
 
+  try {
+    // Chunk 1: metadata + keypoints (no binary)
+    console.log('[MongoDB] Uploading metadata...');
+    await sendChunk({ captureId, chunk: 'meta', ...payload }, 'Metadata upload');
+
+    // Chunk 2: NPY pose-only file
+    console.log('[MongoDB] Uploading NPY pose file...');
+    const npyBase64 = arrayBufferToBase64(npyPoseOnlyBuffer);
+    await sendChunk({ captureId, chunk: 'npy_pose', npy_file: npyBase64 }, 'NPY pose upload');
+
+    // Chunk 3: NPY pose+hands file
+    console.log('[MongoDB] Uploading NPY pose+hands file...');
+    const npyPoseHandsBase64 = arrayBufferToBase64(npyPoseHandsBuffer);
+    await sendChunk({ captureId, chunk: 'npy_hands', npy_file_pose_hands: npyPoseHandsBase64 }, 'NPY hands upload');
+
+    console.log('[MongoDB] All chunks uploaded successfully.');
     return true;
   } catch (err: any) {
     console.error('Web MongoDB direct push failed:', err);
-    let message = err.message;
-    if (message.includes('Unexpected token') || message.includes('DOCTYPE')) {
-      message = 'Netlify function not found. Use "netlify dev" to run locally.';
-    }
-    return { success: false, error: message };
+    return { success: false, error: err.message };
   }
 }
+
 
 export default function App() {
   // Refs
@@ -329,6 +427,16 @@ export default function App() {
   const faceDetectedFramesRef = useRef(0);
   const handDetectedFramesRef = useRef(0);
 
+  // Warnings State and Refs
+  const [multiplePeopleWarning, setMultiplePeopleWarning] = useState(false);
+  const [occlusionWarnings, setOcclusionWarnings] = useState<string[]>([]);
+  
+  const multiplePeopleDetectedDuringRecording = useRef(false);
+  const occludedLimbsDuringRecording = useRef<string[]>([]);
+  const lowVisibilityCountsRef = useRef<Record<number, number>>({
+    25: 0, 26: 0, 27: 0, 28: 0, 31: 0, 32: 0
+  });
+
   // App State
   const [step, setStep] = useState<Step>('home');
   const [isReady, setIsReady] = useState(false);
@@ -338,6 +446,8 @@ export default function App() {
   const [skippedFrames, setSkippedFrames] = useState(0);
   const [faceDetectedFrames, setFaceDetectedFrames] = useState(0);
   const [handDetectedFrames, setHandDetectedFrames] = useState(0);
+  const previousFramesRef = useRef<number[][] | null>(null); // For smoothing
+
   const [duration, setDuration] = useState(0);
   const [latestResults, setLatestResults] = useState<PoseLandmarkerResult | null>(null);
   const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
@@ -350,6 +460,7 @@ export default function App() {
   const [actionType, setActionType] = useState('');
   const [age, setAge] = useState<string>('');
   const [gender, setGender] = useState<Gender>('prefer_not_to_say');
+  const [centerName, setCenterName] = useState<CenterName>(CENTER_OPTIONS[0].value);
   const [cameraFacing, setCameraFacing] = useState<CameraFacing>('user');
   const [captureMode, setCaptureMode] = useState<CaptureMode>('holistic');
   const [clinicianNotes, setClinicianNotes] = useState('');
@@ -380,6 +491,8 @@ export default function App() {
     engineRef.current = null;
     setIsReady(false);
     setLatestResults(null);
+    setMultiplePeopleWarning(false);
+    setOcclusionWarnings([]);
   };
 
   const initCamera = async () => {
@@ -458,6 +571,65 @@ export default function App() {
     setLatestResults(results.pose);
     const poseQuality = analyzePoseFrame(results.pose);
 
+    // 1. Multi-Person Detection Safeguard
+    const numPeople = results.pose?.landmarks?.length || 0;
+    const isMultiPerson = numPeople > 1;
+    setMultiplePeopleWarning(isMultiPerson);
+    if (isMultiPerson && isRecordingRef.current) {
+      multiplePeopleDetectedDuringRecording.current = true;
+    }
+
+    // 2. Real-Time Pose Defect and Occlusion Warnings
+    if (results.pose?.landmarks?.length > 0) {
+      const landmarks = results.pose.landmarks[0];
+      const jointsToTrack = [
+        { index: 25, name: 'Left Knee' },
+        { index: 26, name: 'Right Knee' },
+        { index: 27, name: 'Left Ankle' },
+        { index: 28, name: 'Right Ankle' },
+        { index: 31, name: 'Left Foot' },
+        { index: 32, name: 'Right Foot' }
+      ];
+
+      const newOcclusionWarnings: string[] = [];
+      let leftFootOccluded = false;
+      let rightFootOccluded = false;
+
+      jointsToTrack.forEach(joint => {
+        const lm = landmarks[joint.index];
+        const vis = lm ? (lm.visibility ?? 0) : 0;
+        
+        if (vis < 0.45) {
+          lowVisibilityCountsRef.current[joint.index] = (lowVisibilityCountsRef.current[joint.index] || 0) + 1;
+        } else {
+          lowVisibilityCountsRef.current[joint.index] = 0;
+        }
+
+        if (lowVisibilityCountsRef.current[joint.index] > 5) {
+          if (joint.index === 25) newOcclusionWarnings.push('Left Knee tracking lost.');
+          if (joint.index === 26) newOcclusionWarnings.push('Right Knee tracking lost.');
+          if (joint.index === 27 || joint.index === 31) leftFootOccluded = true;
+          if (joint.index === 28 || joint.index === 32) rightFootOccluded = true;
+          
+          if (isRecordingRef.current && !occludedLimbsDuringRecording.current.includes(joint.name)) {
+            occludedLimbsDuringRecording.current.push(joint.name);
+          }
+        }
+      });
+
+      if (leftFootOccluded && rightFootOccluded) {
+        newOcclusionWarnings.push('Lower body occluded. Ensure feet are visible!');
+      } else if (leftFootOccluded) {
+        newOcclusionWarnings.push('Left Foot/Ankle occluded.');
+      } else if (rightFootOccluded) {
+        newOcclusionWarnings.push('Right Foot/Ankle occluded.');
+      }
+
+      setOcclusionWarnings(newOcclusionWarnings);
+    } else {
+      setOcclusionWarnings([]);
+    }
+
     if (isRecordingRef.current) {
       const elapsed = Date.now() - startTimeRef.current;
       
@@ -492,7 +664,37 @@ export default function App() {
       ]);
 
       
+      // Apply Temporal Smoothing (EMA) if in Half Body mode to prevent flickering
+      if (captureModeRef.current === 'half_body' && previousFramesRef.current) {
+        const smoothing = 0.65; // Higher = more weight to new frame, lower = more smoothing
+        frame.forEach((lm: number[], i: number) => {
+          const prev = previousFramesRef.current![i];
+          if (prev && !lm.some(isNaN) && !prev.some(isNaN)) {
+
+            lm[0] = prev[0] * (1 - smoothing) + lm[0] * smoothing;
+            lm[1] = prev[1] * (1 - smoothing) + lm[1] * smoothing;
+            lm[2] = prev[2] * (1 - smoothing) + lm[2] * smoothing;
+            // Don't smooth visibility as much
+            lm[3] = prev[3] * 0.3 + lm[3] * 0.7;
+          }
+        });
+      }
+
+      // In half_body mode, we aggressively hide low-confidence lower body landmarks
+      if (captureModeRef.current === 'half_body') {
+        frame.forEach((lm: number[], i: number) => {
+
+          // Landmarks 25-32 are knees, ankles, heels, feet
+          if (i >= 25 && lm[3] < 0.45) {
+            lm[0] = 0; lm[1] = 0; lm[2] = 0; lm[3] = 0;
+          }
+        });
+      }
+      
+      previousFramesRef.current = frame.map((f: number[]) => [...f]);
+
       framesRef.current.push(frame);
+
       poseQualityRef.current.push({
         score: poseQuality.score,
         averageVisibility: poseQuality.averageVisibility,
@@ -512,14 +714,114 @@ export default function App() {
         faceBlendshapesRef.current.push([Number.NaN]);
       }
 
+      const rawPoseLandmarks = results.pose?.landmarks?.[0] || [];
+      const poseWorldLandmarks = results.pose?.worldLandmarks?.[0] || [];
+      const leftHand: [number, number, number][] = Array.from({ length: 21 }, () => [Number.NaN, Number.NaN, Number.NaN]);
+      const rightHand: [number, number, number][] = Array.from({ length: 21 }, () => [Number.NaN, Number.NaN, Number.NaN]);
+      let handTrackedThisFrame = false;
+
+      // Calculate ratio of world meters to image coordinates for hand scaling
+      let metersPerUnit = 1.5;
+      if (poseWorldLandmarks.length > 24 && rawPoseLandmarks.length > 24) {
+        const L_HIP = 23;
+        const R_HIP = 24;
+        const L_SHOULDER = 11;
+        const R_SHOULDER = 12;
+
+        const wMidHipX = (poseWorldLandmarks[L_HIP].x + poseWorldLandmarks[R_HIP].x) / 2;
+        const wMidHipY = (poseWorldLandmarks[L_HIP].y + poseWorldLandmarks[R_HIP].y) / 2;
+        const wMidHipZ = (poseWorldLandmarks[L_HIP].z + poseWorldLandmarks[R_HIP].z) / 2;
+
+        const wMidShuX = (poseWorldLandmarks[L_SHOULDER].x + poseWorldLandmarks[R_SHOULDER].x) / 2;
+        const wMidShuY = (poseWorldLandmarks[L_SHOULDER].y + poseWorldLandmarks[R_SHOULDER].y) / 2;
+        const wMidShuZ = (poseWorldLandmarks[L_SHOULDER].z + poseWorldLandmarks[R_SHOULDER].z) / 2;
+
+        const wTorso = Math.sqrt(
+          Math.pow(wMidShuX - wMidHipX, 2) +
+          Math.pow(wMidShuY - wMidHipY, 2) +
+          Math.pow(wMidShuZ - wMidHipZ, 2)
+        );
+
+        const iMidHipX = (rawPoseLandmarks[L_HIP].x + rawPoseLandmarks[R_HIP].x) / 2;
+        const iMidHipY = (rawPoseLandmarks[L_HIP].y + rawPoseLandmarks[R_HIP].y) / 2;
+
+        const iMidShuX = (rawPoseLandmarks[L_SHOULDER].x + rawPoseLandmarks[R_SHOULDER].x) / 2;
+        const iMidShuY = (rawPoseLandmarks[L_SHOULDER].y + rawPoseLandmarks[R_SHOULDER].y) / 2;
+
+        const iTorso = Math.sqrt(
+          Math.pow(iMidShuX - iMidHipX, 2) +
+          Math.pow(iMidShuY - iMidHipY, 2)
+        );
+
+        if (iTorso > 0.01 && wTorso > 0.01) {
+          metersPerUnit = wTorso / iTorso;
+        }
+      }
+
       if (results.hands && results.hands.landmarks && results.hands.landmarks.length > 0) {
-        const landmarks = results.hands.landmarks.flat().map((lm: any) => [coordOrNaN(lm.x), coordOrNaN(lm.y), coordOrNaN(lm.z)]);
-        while (landmarks.length < HAND_LANDMARK_COUNT) landmarks.push(missingPoint());
-        handFramesRef.current.push(landmarks.slice(0, HAND_LANDMARK_COUNT));
+        results.hands.landmarks.forEach((hand: any, idx: number) => {
+          const handedness = results.hands.handedness?.[idx]?.[0]?.categoryName; // "Left" or "Right"
+          const targetHand = handedness === 'Left' ? leftHand : rightHand;
+          handTrackedThisFrame = true;
+
+          // Find the wrist in world coordinates (from pose landmark 15 or 16)
+          const wristPoseIdx = handedness === 'Left' ? 15 : 16;
+          const wWrist = poseWorldLandmarks[wristPoseIdx];
+          const wWristX = wWrist ? coordOrNaN(wWrist.x) : 0;
+          const wWristY = wWrist ? coordOrNaN(wWrist.y) : 0;
+          const wWristZ = wWrist ? coordOrNaN(wWrist.z) : 0;
+
+          // Hand landmarks are relative to hand wrist (landmark 0)
+          const hWrist = hand[0];
+          const hWristX = hWrist ? coordOrNaN(hWrist.x) : 0;
+          const hWristY = hWrist ? coordOrNaN(hWrist.y) : 0;
+          const hWristZ = hWrist ? coordOrNaN(hWrist.z) : 0;
+
+          hand.forEach((lm: any, i: number) => {
+            if (i < 21) {
+              const dx = coordOrNaN(lm.x) - hWristX;
+              const dy = coordOrNaN(lm.y) - hWristY;
+              const dz = coordOrNaN(lm.z) - hWristZ;
+
+              // Convert normalized image offset to meters and anchor to pose wrist
+              targetHand[i] = [
+                wWristX + dx * metersPerUnit,
+                wWristY + dy * metersPerUnit,
+                wWristZ + dz * metersPerUnit
+              ];
+            }
+          });
+        });
+      }
+
+      // Hybrid Fallback: Populate missing hand joints using Pose Landmarker's wrist and fingers in world coordinates
+      const pWristL = poseWorldLandmarks[15];
+      const pThumbL = poseWorldLandmarks[21];
+      const pIndexL = poseWorldLandmarks[19];
+      const pPinkyL = poseWorldLandmarks[17];
+
+      if (Number.isNaN(leftHand[0][0]) && pWristL) leftHand[0] = [coordOrNaN(pWristL.x), coordOrNaN(pWristL.y), coordOrNaN(pWristL.z)];
+      if (Number.isNaN(leftHand[4][0]) && pThumbL) leftHand[4] = [coordOrNaN(pThumbL.x), coordOrNaN(pThumbL.y), coordOrNaN(pThumbL.z)];
+      if (Number.isNaN(leftHand[8][0]) && pIndexL) leftHand[8] = [coordOrNaN(pIndexL.x), coordOrNaN(pIndexL.y), coordOrNaN(pIndexL.z)];
+      if (Number.isNaN(leftHand[20][0]) && pPinkyL) leftHand[20] = [coordOrNaN(pPinkyL.x), coordOrNaN(pPinkyL.y), coordOrNaN(pPinkyL.z)];
+
+      const pWristR = poseWorldLandmarks[16];
+      const pThumbR = poseWorldLandmarks[22];
+      const pIndexR = poseWorldLandmarks[20];
+      const pPinkyR = poseWorldLandmarks[18];
+
+      if (Number.isNaN(rightHand[0][0]) && pWristR) rightHand[0] = [coordOrNaN(pWristR.x), coordOrNaN(pWristR.y), coordOrNaN(pWristR.z)];
+      if (Number.isNaN(rightHand[4][0]) && pThumbR) rightHand[4] = [coordOrNaN(pThumbR.x), coordOrNaN(pThumbR.y), coordOrNaN(pThumbR.z)];
+      if (Number.isNaN(rightHand[8][0]) && pIndexR) rightHand[8] = [coordOrNaN(pIndexR.x), coordOrNaN(pIndexR.y), coordOrNaN(pIndexR.z)];
+      if (Number.isNaN(rightHand[20][0]) && pPinkyR) rightHand[20] = [coordOrNaN(pPinkyR.x), coordOrNaN(pPinkyR.y), coordOrNaN(pPinkyR.z)];
+
+      // Combine left and right hand points (total 42 landmarks)
+      const combinedHandLandmarks = [...leftHand, ...rightHand];
+      handFramesRef.current.push(combinedHandLandmarks);
+
+      if (handTrackedThisFrame) {
         handDetectedFramesRef.current += 1;
         setHandDetectedFrames(handDetectedFramesRef.current);
-      } else {
-        handFramesRef.current.push(missingLandmarkFrame(HAND_LANDMARK_COUNT));
       }
 
       timestampsRef.current.push(elapsed);
@@ -545,7 +847,16 @@ export default function App() {
     setHandDetectedFrames(0);
     setDuration(0);
     setValidationResult(null);
+    previousFramesRef.current = null;
     isRecordingRef.current = true;
+
+    // Reset warnings
+    multiplePeopleDetectedDuringRecording.current = false;
+    occludedLimbsDuringRecording.current = [];
+    lowVisibilityCountsRef.current = { 25: 0, 26: 0, 27: 0, 28: 0, 31: 0, 32: 0 };
+    setMultiplePeopleWarning(false);
+    setOcclusionWarnings([]);
+
     setIsRecording(true);
     setStep('recording');
   };
@@ -553,7 +864,8 @@ export default function App() {
   const stopRecording = () => {
     isRecordingRef.current = false;
     setIsRecording(false);
-    const result = validatePoseData(framesRef.current);
+    const resampledFrames = resampleSequence30FPS(framesRef.current, timestampsRef.current);
+    const result = validatePoseData(resampledFrames);
     setValidationResult(result);
     setStep('confirm');
   };
@@ -561,28 +873,53 @@ export default function App() {
   const handleFinalize = async (destination: 'supabase' | 'mongo' | 'both') => {
     setIsUploading(true);
     
-    const captureId = `web_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+    const slugify = (t: string) => (t || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)+/g, '');
+    const folderParts = [centerName, subjectName, actionType, age, subjectId].map(slugify).filter(Boolean);
+    const folderPrefix = folderParts.join('_');
+    const captureId = `${folderPrefix || 'capture'}_${Date.now()}`;
     const safeAge = parseInt(age);
-    const lastTs = timestampsRef.current[timestampsRef.current.length - 1] || 1;
-    const actualFps = framesRef.current.length / (lastTs / 1000);
-    const recordedFrames = framesRef.current.length;
-    const normalizedFrames = normalizePoseSequence(framesRef.current);
-    const csvString = generateClinicalCsvString(normalizedFrames, timestampsRef.current);
+    
+    // Resample all sequences to a constant 30 FPS grid
+    const resampledFrames = resampleSequence30FPS(framesRef.current, timestampsRef.current);
+    const resampledHandFrames = resampleSequence30FPS(handFramesRef.current, timestampsRef.current);
+    const resampledFaceFrames = resampleSequence30FPS(faceFramesRef.current, timestampsRef.current);
+    const resampledBlendshapes = resampleBlendshapes30FPS(faceBlendshapesRef.current, timestampsRef.current);
+    const resampledTimestamps = Array.from({ length: resampledFrames.length }, (_, idx) => idx * (1000 / 30));
+
+    const actualFps = 30.0;
+    const recordedFrames = resampledFrames.length;
+    const normalizedFrames = normalizePoseSequence(resampledFrames);
+    const csvString = generateClinicalCsvString(normalizedFrames, resampledTimestamps);
+
+    const npyPoseOnlyBuffer = createNpyBuffer(normalizedFrames);
+
+    // Create the pose+hands combined raw data (75 landmarks)
+    const posePlusHandsRaw = resampledFrames.map((poseFrame, t) => {
+      const handFrame = resampledHandFrames[t] || [];
+      const handPart = handFrame.map(hlm => [hlm[0], hlm[1], hlm[2], 1.0]);
+      return [...poseFrame, ...handPart];
+    });
+    const normalizedPoseHands = normalizePoseSequence(posePlusHandsRaw);
+    const npyPoseHandsBuffer = createNpyBuffer(normalizedPoseHands);
 
     const payload = {
       keypoints: normalizedFrames,
       csv_data: csvString,
-      timestamps: timestampsRef.current,
-      face_keypoints: captureMode === 'holistic' ? faceFramesRef.current : missingLandmarkFrames(recordedFrames, FACE_LANDMARK_COUNT),
-      face_blendshapes: captureMode === 'holistic' ? faceBlendshapesRef.current : missingBlendshapeFrames(recordedFrames),
-      hand_keypoints: captureMode === 'holistic' ? handFramesRef.current : missingLandmarkFrames(recordedFrames, HAND_LANDMARK_COUNT),
+      timestamps: resampledTimestamps,
+      face_keypoints: captureMode === 'holistic' ? resampledFaceFrames : missingLandmarkFrames(recordedFrames, FACE_LANDMARK_COUNT),
+      face_blendshapes: captureMode === 'holistic' ? resampledBlendshapes : missingBlendshapeFrames(recordedFrames),
+      hand_keypoints: captureMode === 'holistic' ? resampledHandFrames : missingLandmarkFrames(recordedFrames, HAND_LANDMARK_COUNT),
       quality: {
         pose: summarizePoseQuality(poseQualityRef.current, skippedFramesRef.current),
         holistic: {
           face_detected_frames: faceDetectedFramesRef.current,
           hand_detected_frames: handDetectedFramesRef.current
         },
-        validation: validationResult
+        validation: validationResult,
+        warnings: {
+          multiple_people_detected: multiplePeopleDetectedDuringRecording.current,
+          occluded_limbs: occludedLimbsDuringRecording.current
+        }
       },
       meta: {
         capture_mode: captureMode,
@@ -596,6 +933,7 @@ export default function App() {
         action_type: actionType,
         age: isNaN(safeAge) ? null : safeAge,
         gender: gender,
+        center_name: centerName,
         clinician_notes: clinicianNotes
       }
     };
@@ -604,10 +942,10 @@ export default function App() {
     let errorMessage = '';
 
     if (destination === 'supabase') {
-      success = await uploadToSupabaseDirect(payload, captureId, csvString);
+      success = await uploadToSupabaseDirect(payload, captureId, csvString, npyPoseOnlyBuffer, npyPoseHandsBuffer);
       if (!success) errorMessage = 'Unknown Supabase error';
     } else if (destination === 'mongo') {
-      const result = await pushToMongoDirect(payload, captureId);
+      const result = await pushToMongoDirect(payload, captureId, npyPoseOnlyBuffer, npyPoseHandsBuffer);
       if (result === true) {
         success = true;
       } else {
@@ -616,8 +954,8 @@ export default function App() {
       }
     } else if (destination === 'both') {
       const [sRes, mRes] = await Promise.all([
-        uploadToSupabaseDirect(payload, captureId, csvString),
-        pushToMongoDirect(payload, captureId)
+        uploadToSupabaseDirect(payload, captureId, csvString, npyPoseOnlyBuffer, npyPoseHandsBuffer),
+        pushToMongoDirect(payload, captureId, npyPoseOnlyBuffer, npyPoseHandsBuffer)
       ]);
       
       const sSuccess = sRes === true;
@@ -687,8 +1025,10 @@ export default function App() {
   };
 
   const downloadCsv = () => {
-    const normalizedFrames = normalizePoseSequence(framesRef.current);
-    const csvString = generateClinicalCsvString(normalizedFrames, timestampsRef.current);
+    const resampledFrames = resampleSequence30FPS(framesRef.current, timestampsRef.current);
+    const resampledTimestamps = Array.from({ length: resampledFrames.length }, (_, idx) => idx * (1000 / 30));
+    const normalizedFrames = normalizePoseSequence(resampledFrames);
+    const csvString = generateClinicalCsvString(normalizedFrames, resampledTimestamps);
     if (!csvString) return;
 
     const blob = new Blob([csvString], { type: 'text/csv' });
@@ -724,6 +1064,21 @@ export default function App() {
                 <div>
                   <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Subject ID</label>
                   <input className="input-field" value={subjectId} onChange={e => setSubjectId(e.target.value)} placeholder="ID" />
+                </div>
+                <div>
+                  <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Center Name</label>
+                  <div className="chip-grid" style={{marginTop: 4}}>
+                    {CENTER_OPTIONS.map(opt => (
+                      <div 
+                        key={opt.value}
+                        className={`chip ${centerName === opt.value ? 'active' : ''}`}
+                        onClick={() => setCenterName(opt.value)}
+                        style={{padding: '6px 12px', fontSize: 11}}
+                      >
+                        {opt.label}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
 
@@ -804,22 +1159,30 @@ export default function App() {
               
               <div style={{marginTop: 12}}>
                 <label className="input-label" style={{fontSize: 11, fontWeight: 700, color: '#444'}}>Capture Mode</label>
-                <div style={{display: 'flex', gap: 8, marginTop: 4}}>
+                <div style={{display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginTop: 4}}>
                   <button 
                     className={`chip ${captureMode === 'pose_only' ? 'active' : ''}`}
-                    style={{flex: 1, textAlign: 'center'}}
+                    style={{textAlign: 'center'}}
                     onClick={() => setCaptureMode('pose_only')}
                   >
-                    Pose Only
+                    Pose
                   </button>
                   <button 
                     className={`chip ${captureMode === 'holistic' ? 'active' : ''}`}
-                    style={{flex: 1, textAlign: 'center'}}
+                    style={{textAlign: 'center'}}
                     onClick={() => setCaptureMode('holistic')}
                   >
                     Holistic
                   </button>
+                  <button 
+                    className={`chip ${captureMode === 'half_body' ? 'active' : ''}`}
+                    style={{textAlign: 'center'}}
+                    onClick={() => setCaptureMode('half_body')}
+                  >
+                    Half-Body
+                  </button>
                 </div>
+
               </div>
 
               <button 
@@ -873,6 +1236,60 @@ export default function App() {
               <button className="flip-btn" onClick={toggleCamera}>
                 <FlipHorizontal size={20} />
               </button>
+
+              {/* Warnings Overlay */}
+              {(multiplePeopleWarning || occlusionWarnings.length > 0) && (
+                <div className="warnings-overlay" style={{
+                  position: 'absolute',
+                  top: '12px',
+                  left: '12px',
+                  right: '12px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '8px',
+                  zIndex: 10,
+                  pointerEvents: 'none'
+                }}>
+                  {multiplePeopleWarning && (
+                    <div className="warning-banner" style={{
+                      backgroundColor: 'rgba(239, 68, 68, 0.95)',
+                      color: 'white',
+                      padding: '10px 14px',
+                      borderRadius: '10px',
+                      fontSize: '13px',
+                      fontWeight: 600,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                      boxShadow: '0 4px 15px rgba(0, 0, 0, 0.25)',
+                      backdropFilter: 'blur(4px)',
+                      border: '1px solid rgba(255, 255, 255, 0.1)'
+                    }}>
+                      <AlertCircle size={16} />
+                      <span>Multiple people detected in frame. Only the subject should be in camera view.</span>
+                    </div>
+                  )}
+                  {occlusionWarnings.map((warnMsg, idx) => (
+                    <div key={idx} className="warning-banner" style={{
+                      backgroundColor: 'rgba(217, 119, 6, 0.95)',
+                      color: 'white',
+                      padding: '10px 14px',
+                      borderRadius: '10px',
+                      fontSize: '13px',
+                      fontWeight: 600,
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: '8px',
+                      boxShadow: '0 4px 15px rgba(0, 0, 0, 0.25)',
+                      backdropFilter: 'blur(4px)',
+                      border: '1px solid rgba(255, 255, 255, 0.1)'
+                    }}>
+                      <AlertCircle size={16} />
+                      <span>{warnMsg}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
 
               {isRecording && (
                 <>
@@ -961,6 +1378,32 @@ export default function App() {
                   Upload is disabled because this capture failed quality checks.
                 </p>
               )}
+
+              {/* Warnings Summary Card */}
+              {(multiplePeopleDetectedDuringRecording.current || occludedLimbsDuringRecording.current.length > 0) && (
+                <div style={{
+                  marginTop: 12,
+                  padding: '10px 12px',
+                  borderRadius: 10,
+                  backgroundColor: 'rgba(217, 119, 6, 0.1)',
+                  border: '1px solid #d97706',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 6
+                }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, color: '#d97706', display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <AlertCircle size={16} color="#d97706" /> Capture Warnings
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                    {multiplePeopleDetectedDuringRecording.current && (
+                      <p style={{ margin: '2px 0' }}>• Multiple people were detected in the camera view during this recording.</p>
+                    )}
+                    {occludedLimbsDuringRecording.current.length > 0 && (
+                      <p style={{ margin: '2px 0' }}>• Occluded or low-confidence tracking detected on: {occludedLimbsDuringRecording.current.join(', ')}.</p>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
 
             <div className="card">
@@ -985,6 +1428,21 @@ export default function App() {
                 <div>
                   <label style={{fontSize: 10, fontWeight: 700}}>Action</label>
                   <input className="input-field" value={actionType} onChange={e => setActionType(e.target.value)} />
+                </div>
+                <div>
+                  <label style={{fontSize: 10, fontWeight: 700}}>Center Name</label>
+                  <div className="chip-grid" style={{marginTop: 2}}>
+                    {CENTER_OPTIONS.map(opt => (
+                      <div 
+                        key={opt.value}
+                        className={`chip ${centerName === opt.value ? 'active' : ''}`}
+                        onClick={() => setCenterName(opt.value)}
+                        style={{padding: '4px 10px', fontSize: 10}}
+                      >
+                        {opt.label}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               </div>
 

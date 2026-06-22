@@ -268,12 +268,13 @@ export function validatePoseData(frames: number[][][]): ValidationResult {
 
 export function createNpyBuffer(frames: number[][][]): ArrayBuffer {
   const T = frames.length;
+  const numLandmarks = T > 0 ? (frames[0]?.length || POSE_LANDMARK_COUNT) : POSE_LANDMARK_COUNT;
   const NPY_VALUES_PER_LANDMARK = 3;
-  const NPY_VALUES_PER_FRAME = POSE_LANDMARK_COUNT * NPY_VALUES_PER_LANDMARK;
+  const NPY_VALUES_PER_FRAME = numLandmarks * NPY_VALUES_PER_LANDMARK;
   const data = new Float32Array(T * NPY_VALUES_PER_FRAME);
 
   for (let t = 0; t < T; t++) {
-    for (let i = 0; i < POSE_LANDMARK_COUNT; i++) {
+    for (let i = 0; i < numLandmarks; i++) {
       const base = t * NPY_VALUES_PER_FRAME + i * NPY_VALUES_PER_LANDMARK;
       const x = frames[t]?.[i]?.[0];
       const y = frames[t]?.[i]?.[1];
@@ -285,7 +286,7 @@ export function createNpyBuffer(frames: number[][][]): ArrayBuffer {
   }
 
   const magic = new Uint8Array([147, 78, 85, 77, 80, 89]);
-  const dictStr = "{'descr': '<f4', 'fortran_order': False, 'shape': (" + T + ", 33, 3), }";
+  const dictStr = "{'descr': '<f4', 'fortran_order': False, 'shape': (" + T + ", " + numLandmarks + ", 3), }";
 
   let totalLen = 10 + dictStr.length + 1;
   let paddingLen = 64 - (totalLen % 64);
@@ -479,3 +480,132 @@ export function normalizePoseSequence(frames: number[][][]): number[][][] {
 
   return centered;
 }
+
+export function resampleSequence30FPS(frames: number[][][], timestamps: number[]): number[][][] {
+  if (frames.length === 0) return [];
+  if (frames.length === 1 || timestamps.length < 2) {
+    return frames;
+  }
+
+  const lastTs = timestamps[timestamps.length - 1];
+  const targetInterval = 1000 / 30; // 33.3333 ms
+  const numTargetFrames = Math.max(1, Math.round(lastTs / targetInterval));
+  
+  const resampled: number[][][] = [];
+
+  for (let i = 0; i <= numTargetFrames; i++) {
+    const tTarget = Math.max(0, Math.min(i * targetInterval, lastTs));
+    
+    // Find interpolation bounds
+    let prevIdx = 0;
+    let nextIdx = timestamps.length - 1;
+
+    for (let j = 0; j < timestamps.length; j++) {
+      if (timestamps[j] <= tTarget) {
+        prevIdx = j;
+      }
+      if (timestamps[j] >= tTarget) {
+        nextIdx = j;
+        break;
+      }
+    }
+
+    const tPrev = timestamps[prevIdx];
+    const tNext = timestamps[nextIdx];
+    const framePrev = frames[prevIdx];
+    const frameNext = frames[nextIdx];
+
+    const numLandmarks = framePrev.length;
+    const resampledFrame: number[][] = [];
+
+    if (tPrev === tNext || prevIdx === nextIdx) {
+      // Take exact frame copy
+      for (let l = 0; l < numLandmarks; l++) {
+        resampledFrame.push([...framePrev[l]]);
+      }
+    } else {
+      const alpha = (tTarget - tPrev) / (tNext - tPrev);
+      for (let l = 0; l < numLandmarks; l++) {
+        const lmPrev = framePrev[l];
+        const lmNext = frameNext[l];
+        const resampledLandmark: number[] = [];
+
+        // Interpolate x, y, z, visibility (if present)
+        for (let c = 0; c < lmPrev.length; c++) {
+          const valPrev = lmPrev[c];
+          const valNext = lmNext[c];
+          if (Number.isFinite(valPrev) && Number.isFinite(valNext)) {
+            resampledLandmark.push(valPrev + alpha * (valNext - valPrev));
+          } else {
+            resampledLandmark.push(NaN);
+          }
+        }
+        resampledFrame.push(resampledLandmark);
+      }
+    }
+    resampled.push(resampledFrame);
+  }
+
+  return resampled;
+}
+
+export function resampleBlendshapes30FPS(blendshapes: number[][], timestamps: number[]): number[][] {
+  if (blendshapes.length === 0) return [];
+  if (blendshapes.length === 1 || timestamps.length < 2) {
+    return blendshapes;
+  }
+
+  const lastTs = timestamps[timestamps.length - 1];
+  const targetInterval = 1000 / 30; // 33.3333 ms
+  const numTargetFrames = Math.max(1, Math.round(lastTs / targetInterval));
+  
+  const resampled: number[][] = [];
+
+  for (let i = 0; i <= numTargetFrames; i++) {
+    const tTarget = Math.max(0, Math.min(i * targetInterval, lastTs));
+    
+    // Find interpolation bounds
+    let prevIdx = 0;
+    let nextIdx = timestamps.length - 1;
+
+    for (let j = 0; j < timestamps.length; j++) {
+      if (timestamps[j] <= tTarget) {
+        prevIdx = j;
+      }
+      if (timestamps[j] >= tTarget) {
+        nextIdx = j;
+        break;
+      }
+    }
+
+    const tPrev = timestamps[prevIdx];
+    const tNext = timestamps[nextIdx];
+    const bsPrev = blendshapes[prevIdx];
+    const bsNext = blendshapes[nextIdx];
+
+    const numShapes = bsPrev.length;
+    const resampledBS: number[] = [];
+
+    if (tPrev === tNext || prevIdx === nextIdx) {
+      // Take exact copy
+      for (let s = 0; s < numShapes; s++) {
+        resampledBS.push(bsPrev[s]);
+      }
+    } else {
+      const alpha = (tTarget - tPrev) / (tNext - tPrev);
+      for (let s = 0; s < numShapes; s++) {
+        const valPrev = bsPrev[s];
+        const valNext = bsNext[s];
+        if (Number.isFinite(valPrev) && Number.isFinite(valNext)) {
+          resampledBS.push(valPrev + alpha * (valNext - valPrev));
+        } else {
+          resampledBS.push(NaN);
+        }
+      }
+    }
+    resampled.push(resampledBS);
+  }
+
+  return resampled;
+}
+

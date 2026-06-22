@@ -55,3 +55,10 @@ mobile/android/captures/
 
 # Local Netlify folder
 .netlify
+
+# Ignore archive/backup files
+*.rar
+
+# Ignore root dist if building inside web/dist
+dist/
+

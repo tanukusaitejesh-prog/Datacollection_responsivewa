@@ -58,6 +58,60 @@ export class PoseEngine {
   private onResultsCallbacks: HolisticCallback[] = [];
   private isLoaded = false;
 
+  // Anti-flicker, subject tracking, and smoothing states
+  private lastTrackedRawLandmarks: any[] | null = null;
+  private lastTrackedRawWorldLandmarks: any[] | null = null;
+  private lastTrackedSmoothedLandmarks: any[] | null = null;
+  private framesSinceLastPose = 0;
+  private maxHoldFrames = 5;
+  private smoothingFactor = 0.5; // alpha for EMA visual smoothing (0.5 is visual sweet spot)
+
+  private getPoseDistance(poseA: any[], poseB: any[]): number {
+    const joints = [0, 11, 12, 23, 24]; // nose, shoulders, hips
+    let distSum = 0;
+    let count = 0;
+    for (const j of joints) {
+      if (poseA[j] && poseB[j]) {
+        const dx = poseA[j].x - poseB[j].x;
+        const dy = poseA[j].y - poseB[j].y;
+        distSum += Math.sqrt(dx * dx + dy * dy);
+        count++;
+      }
+    }
+    return count > 0 ? distSum / count : Infinity;
+  }
+
+  private getPoseArea(pose: any[]): number {
+    let minX = 1, maxX = 0, minY = 1, maxY = 0;
+    let count = 0;
+    for (const lm of pose) {
+      if (lm && (lm.visibility ?? 0) > 0.2) {
+        if (lm.x < minX) minX = lm.x;
+        if (lm.x > maxX) maxX = lm.x;
+        if (lm.y < minY) minY = lm.y;
+        if (lm.y > maxY) maxY = lm.y;
+        count++;
+      }
+    }
+    return count > 5 ? (maxX - minX) * (maxY - minY) : 0;
+  }
+
+  private smoothLandmarks(current: any[], last: any[]): any[] {
+    const alpha = this.smoothingFactor;
+    return current.map((lm, i) => {
+      const prev = last[i];
+      if (!prev) return lm;
+      return {
+        x: prev.x * (1 - alpha) + lm.x * alpha,
+        y: prev.y * (1 - alpha) + lm.y * alpha,
+        z: prev.z * (1 - alpha) + lm.z * alpha,
+        visibility: prev.visibility * (1 - alpha) + (lm.visibility ?? 0) * alpha
+      };
+    });
+  }
+
+
+
   constructor(_video: HTMLVideoElement, canvas: HTMLCanvasElement) {
     this.canvasElement = canvas;
     this.canvasCtx = canvas.getContext('2d')!;
@@ -76,7 +130,7 @@ export class PoseEngine {
           delegate: "GPU"
         },
         runningMode: "VIDEO",
-        numPoses: 1,
+        numPoses: 3,
         minPoseDetectionConfidence: 0.5,
         minPosePresenceConfidence: 0.5,
         minTrackingConfidence: 0.5
@@ -102,9 +156,9 @@ export class PoseEngine {
         },
         runningMode: "VIDEO",
         numHands: 2,
-        minHandDetectionConfidence: 0.4,
-        minHandPresenceConfidence: 0.4,
-        minTrackingConfidence: 0.4
+        minHandDetectionConfidence: 0.3,
+        minHandPresenceConfidence: 0.3,
+        minTrackingConfidence: 0.3
       });
 
       this.isLoaded = true;
@@ -144,13 +198,84 @@ export class PoseEngine {
     face: FaceLandmarkerResult | null;
     hands: HandLandmarkerResult | null;
   }) {
+    let drawLandmarks: any[] | null = null;
+
+    // ── Subject Tracking, Hold, and Smoothing Logic ──
+    if (results.pose) {
+      const poseAny = results.pose as any;
+      if (!poseAny.landmarks) poseAny.landmarks = [];
+      if (!poseAny.worldLandmarks) poseAny.worldLandmarks = [];
+      const detectedCount = poseAny.landmarks.length;
+
+      if (detectedCount > 0) {
+        let bestIdx = 0;
+        if (this.lastTrackedRawLandmarks) {
+          // Track closest pose
+          let minDist = Infinity;
+          for (let i = 0; i < detectedCount; i++) {
+            const dist = this.getPoseDistance(poseAny.landmarks[i], this.lastTrackedRawLandmarks);
+            if (dist < minDist) {
+              minDist = dist;
+              bestIdx = i;
+            }
+          }
+        } else {
+          // Initialize tracking with largest pose (bounding box area)
+          let maxArea = -1;
+          for (let i = 0; i < detectedCount; i++) {
+            const area = this.getPoseArea(poseAny.landmarks[i]);
+            if (area > maxArea) {
+              maxArea = area;
+              bestIdx = i;
+            }
+          }
+        }
+
+        const rawPose = poseAny.landmarks[bestIdx];
+        const rawWorldPose = poseAny.worldLandmarks[bestIdx] || rawPose;
+
+        // Apply EMA smoothing ONLY to the visual preview coordinates
+        let smoothedPose = rawPose;
+        if (this.lastTrackedSmoothedLandmarks) {
+          smoothedPose = this.smoothLandmarks(rawPose, this.lastTrackedSmoothedLandmarks);
+        }
+
+        this.lastTrackedRawLandmarks = rawPose;
+        this.lastTrackedRawWorldLandmarks = rawWorldPose;
+        this.lastTrackedSmoothedLandmarks = smoothedPose;
+        this.framesSinceLastPose = 0;
+
+        // Keep raw tracked & dropout-held data for Supabase/Mongo upload
+        poseAny.landmarks = [rawPose];
+        poseAny.worldLandmarks = [rawWorldPose];
+        
+        // Draw the smoothed pose on the canvas
+        drawLandmarks = smoothedPose;
+      } else {
+        // Handle temporary tracking dropouts (anti-flicker hold)
+        if (this.lastTrackedRawLandmarks && this.framesSinceLastPose < this.maxHoldFrames) {
+          this.framesSinceLastPose++;
+          poseAny.landmarks = [this.lastTrackedRawLandmarks];
+          poseAny.worldLandmarks = [this.lastTrackedRawWorldLandmarks || this.lastTrackedRawLandmarks];
+          
+          drawLandmarks = this.lastTrackedSmoothedLandmarks || this.lastTrackedRawLandmarks;
+        } else {
+          this.lastTrackedRawLandmarks = null;
+          this.lastTrackedRawWorldLandmarks = null;
+          this.lastTrackedSmoothedLandmarks = null;
+          poseAny.landmarks = [];
+          poseAny.worldLandmarks = [];
+        }
+      }
+    }
+
     const ctx = this.canvasCtx;
     const { width, height } = this.canvasElement;
 
     ctx.clearRect(0, 0, width, height);
 
-    if (results.pose && results.pose.landmarks && results.pose.landmarks.length > 0) {
-      const landmarks = results.pose.landmarks[0];
+    if (drawLandmarks && drawLandmarks.length > 0) {
+      const landmarks = drawLandmarks;
       
       // Calculate synthetic neck point (midpoint of shoulders)
       const p11 = landmarks[11];
@@ -171,9 +296,8 @@ export class PoseEngine {
         let y = lm.y * height;
         
         // Foot landmark spread (indices 29, 30, 31, 32)
-        // 27=L_Ankle, 28=R_Ankle, 29=L_Heel, 30=R_Heel, 31=L_FootIndex, 32=R_FootIndex
         if (i >= 29 && i <= 32) {
-          const ankleIdx = i % 2 === 1 ? 27 : 28; // 29,31 -> 27; 30,32 -> 28
+          const ankleIdx = i % 2 === 1 ? 27 : 28;
           const ankle = landmarks[ankleIdx];
           if (ankle) {
             const ax = ankle.x * width;
@@ -182,7 +306,6 @@ export class PoseEngine {
             const dy = y - ay;
             const dist = Math.sqrt(dx * dx + dy * dy);
             if (dist < 5) {
-              // Apply minimum spread of 5px
               const scale = 5 / (dist || 1);
               x = ax + dx * scale;
               y = ay + dy * scale;
@@ -193,12 +316,13 @@ export class PoseEngine {
         return { x, y, z: lm.z, visibility: lm.visibility ?? 0 };
       });
 
-      // Draw Edges (Performance Optimized)
+      // Draw Edges (Smooth Fading for Anti-Flicker)
       SKELETON_EDGES.forEach(([from, to]) => {
         const p1 = pixelCoords[from];
         const p2 = pixelCoords[to];
-        if (p1 && p2 && p1.visibility > 0.4 && p2.visibility > 0.4) {
-          const alpha = clamp((p1.visibility + p2.visibility) * 0.5, 0.15, 1);
+        if (p1 && p2 && p1.visibility > 0.2 && p2.visibility > 0.2) {
+          const meanVis = (p1.visibility + p2.visibility) * 0.5;
+          const alpha = clamp(meanVis * 0.85, 0.15, 0.85);
           ctx.beginPath();
           ctx.moveTo(Math.round(p1.x), Math.round(p1.y));
           ctx.lineTo(Math.round(p2.x), Math.round(p2.y));
@@ -209,36 +333,40 @@ export class PoseEngine {
       });
 
       // Draw Synthetic Neck Connection
-      if (hasNeck && nose && nose.visibility > 0.4) {
+      if (hasNeck && nose && nose.visibility > 0.2) {
         const nx = Math.round(nose.x * width);
         const ny = Math.round(nose.y * height);
         const nkx = Math.round(neckX * width);
         const nky = Math.round(neckY * height);
         
+        const alpha = clamp(nose.visibility * 0.85, 0.15, 0.85);
         ctx.beginPath();
         ctx.moveTo(nx, ny);
         ctx.lineTo(nkx, nky);
-        ctx.strokeStyle = `rgba(120, 220, 255, ${nose.visibility})`;
+        ctx.strokeStyle = `rgba(120, 220, 255, ${alpha})`;
         ctx.lineWidth = 4;
         ctx.stroke();
       }
 
-      // Draw All Joints
+      // Draw All Joints (Smooth Fading for Anti-Flicker)
       pixelCoords.forEach((lm) => {
-        if (lm.visibility < 0.4) return;
+        if (lm.visibility < 0.2) return;
         
         const x = Math.round(lm.x);
         const y = Math.round(lm.y);
         const radius = 2 + lm.visibility * 3;
+        const alpha = clamp(lm.visibility, 0.3, 1.0);
 
         ctx.beginPath();
         ctx.arc(x, y, radius, 0, 2 * Math.PI);
         ctx.fillStyle = zToColor(lm.z);
+        ctx.globalAlpha = alpha;
         ctx.fill();
-        ctx.strokeStyle = 'white';
+        ctx.strokeStyle = `rgba(255, 255, 255, ${alpha})`;
         ctx.lineWidth = 1;
         ctx.stroke();
       });
+      ctx.globalAlpha = 1.0; // Reset canvas global alpha
     }
 
     // Detailed Face Mesh (Contours)

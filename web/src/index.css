@@ -85,6 +85,26 @@ body {
   margin-top: 8px;
 }
 
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.form-grid > div:last-child:nth-child(odd) {
+  grid-column: span 2;
+}
+
+.form-grid-spaced {
+  margin-top: 16px;
+}
+
+.form-grid-compact {
+  gap: 8px;
+  margin-top: 8px;
+}
+
 .chip {
   border: 1px solid #AFC1CF;
   background: #FFFFFF;
